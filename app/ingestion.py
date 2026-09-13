@@ -1,14 +1,18 @@
 """文档入库：加载 → 分块 → 向量化 → 存向量索引（FAISS 或 Qdrant）。
 
 支持 PDF 与 Word(.docx) 两种格式，解析后统一成同一套 metadata 结构
-（source / file_name / page），便于后续混合检索。
+（source / file_name / page / chunk_id），便于后续混合检索。
+
+分块时做中文标题增强：识别章节标题后拼到其下每个 chunk 的正文前，
+形如 "[标题] 第三章 报销流程\n正文…"，提升关键词与向量召回的可定位性。
 """
 
 import logging
 import os
+import re
 
 import docx
-from langchain_community.document_loaders import PyMuPDFLoader
+import pymupdf
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -18,6 +22,22 @@ logger = logging.getLogger(__name__)
 
 # 支持入库的文件扩展名（均小写）
 SUPPORTED_EXTENSIONS = (".pdf", ".docx")
+
+# 标题启发式：中文章节号 / 多级数字编号 / 中文序号列举
+_HEADING_PATTERNS = (
+    re.compile(r"^第\s*[0-9一二三四五六七八九十百零]+\s*[章节篇条部分]"),
+    re.compile(r"^\d+(\.\d+)+[\s、.．]"),
+    re.compile(r"^[一二三四五六七八九十]+\s*[、.．]\s*\S"),
+)
+# 标题行长度上限，超长的多半是正文而非标题
+_MAX_HEADING_LEN = 40
+# 以这些标点结尾的加粗短行通常是一句正文，不作为标题
+_SENTENCE_ENDINGS = ("。", "！", "？", "；", ".", "!", "?", ";")
+# 短行判定上限：加粗且不超过该长度才算标题
+_MAX_BOLD_HEADING_LEN = 20
+
+# PyMuPDF span.flags 第 4 位表示粗体
+_PYMUPDF_BOLD_FLAG = 1 << 4
 
 
 def normalize_source(path: str) -> str:
@@ -33,32 +53,172 @@ def _build_splitter() -> RecursiveCharacterTextSplitter:
     )
 
 
+def _is_heading(text: str, bold: bool = False) -> bool:
+    """判断一行文本是否像标题：章节号/数字编号开头，或加粗的短行。"""
+    line = text.strip()
+    if not line or len(line) > _MAX_HEADING_LEN:
+        return False
+    if any(pattern.match(line) for pattern in _HEADING_PATTERNS):
+        return True
+    # 加粗短行也算标题，但以句末标点结尾的通常是一句正文（如“本办法由人力资源部负责解释。”）
+    return (
+        bold
+        and len(line) <= _MAX_BOLD_HEADING_LEN
+        and not line.endswith(_SENTENCE_ENDINGS)
+    )
+
+
+def _group_sections(blocks: list[tuple[str, bool]]) -> list[tuple[str | None, str]]:
+    """把 [(文本, 是否标题)] 归并成 [(所属标题, 正文)] 分节。
+
+    标题下没有正文时（如连续两个标题、或文末标题），把标题本身作为独立一节，
+    避免标题文本在切分时被丢掉。
+    """
+    sections: list[tuple[str | None, str]] = []
+    heading: str | None = None
+    buffer: list[str] = []
+
+    def flush() -> None:
+        nonlocal heading
+        if buffer:
+            sections.append((heading, "\n".join(buffer)))
+            buffer.clear()
+        elif heading is not None:
+            sections.append((None, heading))
+            heading = None
+
+    for text, is_heading in blocks:
+        if is_heading:
+            flush()
+            heading = text
+        else:
+            buffer.append(text)
+    flush()
+    return sections
+
+
+def _section_to_chunks(
+    splitter: RecursiveCharacterTextSplitter, heading: str | None, text: str
+) -> list[str]:
+    """切分一节正文，并把标题拼到该节每个分块前面。
+
+    形如 "[标题] 第三章 报销流程\\n正文…"；没有标题时原样返回。
+    """
+    pieces = [piece for piece in splitter.split_text(text) if piece.strip()]
+    if not heading:
+        return pieces
+    return [f"[标题] {heading}\n{piece}" for piece in pieces]
+
+
+def _finalize_chunks(chunks: list[Document], file_path: str) -> list[Document]:
+    """统一补 metadata：source / file_name / page / chunk_id。
+
+    chunk_id 形如 "{file_name}_p{page}_{i}"，i 为文档内块序号，
+    供混合检索的 RRF 融合作为唯一 key（同一页的多个分块必须能区分开）。
+    """
+    file_name = os.path.basename(file_path)
+    source = normalize_source(file_path)
+    for i, chunk in enumerate(chunks):
+        page = chunk.metadata.get("page", 0)
+        chunk.metadata = {
+            "source": source,
+            "file_name": file_name,
+            "page": page,
+            "chunk_id": f"{file_name}_p{page}_{i}",
+        }
+    return chunks
+
+
+def _pdf_page_blocks(page) -> list[tuple[str, bool]]:
+    """按 block 顺序读出一页的 [(文本, 是否标题)]。"""
+    blocks = []
+    # type=0 为文本块，1 为图片块（图片无文字，跳过即可）
+    for block in page.get_text("dict").get("blocks", []):
+        if block.get("type") != 0:
+            continue
+
+        lines, bold_chars, total_chars = [], 0, 0
+        for line in block.get("lines", []):
+            line_text = "".join(
+                span.get("text", "") for span in line.get("spans", [])
+            ).strip()
+            if line_text:
+                lines.append(line_text)
+            for span in line.get("spans", []):
+                span_text = span.get("text", "").strip()
+                total_chars += len(span_text)
+                if span.get("flags", 0) & _PYMUPDF_BOLD_FLAG:
+                    bold_chars += len(span_text)
+
+        text = "\n".join(lines).strip()
+        if not text:
+            continue
+
+        # 整块大部分字符加粗时视为加粗块
+        is_bold = total_chars > 0 and bold_chars / total_chars >= 0.6
+        blocks.append((text, _is_heading(text, bold=is_bold)))
+    return blocks
+
+
+def _docx_paragraph_is_bold(paragraph) -> bool:
+    """段落是否整体加粗（Word 里常用作小标题）。"""
+    runs = [run for run in paragraph.runs if run.text.strip()]
+    return bool(runs) and all(run.bold for run in runs)
+
+
+def _docx_is_heading(paragraph) -> bool:
+    """判断 Word 段落是否为标题：套用标题样式，或加粗短行，或章节号开头。"""
+    style_name = paragraph.style.name if paragraph.style is not None else ""
+    if "Heading" in style_name or "标题" in style_name:
+        return True
+    return _is_heading(paragraph.text, bold=_docx_paragraph_is_bold(paragraph))
+
+
+def _docx_blocks(document) -> list[tuple[str, bool]]:
+    """按段落顺序读出 Word 正文的 [(文本, 是否标题)]，表格行附在最后。"""
+    blocks = []
+    for paragraph in document.paragraphs:
+        text = paragraph.text.strip()
+        if text:
+            blocks.append((text, _docx_is_heading(paragraph)))
+
+    # 表格行用制表符连接以保留行列关系；合并单元格可能重复，轻微重复可接受
+    for table in document.tables:
+        for row in table.rows:
+            cells = [cell.text.strip() for cell in row.cells]
+            if any(cells):
+                blocks.append(("\t".join(cells), False))
+    return blocks
+
+
 def _split_pdf(file_path: str) -> list[Document]:
-    """加载 PDF 并切分为带 metadata 的分块。"""
+    """加载 PDF 并切分为带 metadata 的分块（页码 1-based，含标题增强）。"""
     logger.info("正在解析 PDF：%s", file_path)
-    pages = PyMuPDFLoader(file_path).load()
-    if not pages:
+    splitter = _build_splitter()
+    chunks: list[Document] = []
+
+    with pymupdf.open(file_path) as pdf:
+        page_count = pdf.page_count
+        for page_number, page in enumerate(pdf, start=1):
+            for heading, text in _group_sections(_pdf_page_blocks(page)):
+                for content in _section_to_chunks(splitter, heading, text):
+                    chunks.append(
+                        Document(page_content=content, metadata={"page": page_number})
+                    )
+
+    if not chunks:
         logger.warning("PDF 无可用文本内容：%s", file_path)
         return []
 
-    chunks = _build_splitter().split_documents(pages)
-
-    file_name = os.path.basename(file_path)
-    for chunk in chunks:
-        # PyMuPDFLoader 的 page 从 0 开始，这里转成人类可读的 1-based 页码
-        page = chunk.metadata.get("page", 0) + 1
-        chunk.metadata = {
-            "source": normalize_source(file_path),
-            "file_name": file_name,
-            "page": page,
-        }
-
-    logger.info("%s → %d 页 → %d 个分块", file_name, len(pages), len(chunks))
+    _finalize_chunks(chunks, file_path)
+    logger.info(
+        "%s → %d 页 → %d 个分块", os.path.basename(file_path), page_count, len(chunks)
+    )
     return chunks
 
 
 def _split_docx(file_path: str) -> list[Document]:
-    """加载 Word(.docx) 并切分为带 metadata 的分块。
+    """加载 Word(.docx) 并切分为带 metadata 的分块（含标题增强）。
 
     python-docx 只能读取段落与表格中的文本；文档里的图片、文本框、SmartArt
     读不到，这属于正常情况，不视为错误。docx 没有页码概念，page 统一填 0，
@@ -66,35 +226,19 @@ def _split_docx(file_path: str) -> list[Document]:
     """
     logger.info("正在解析 Word：%s", file_path)
     document = docx.Document(file_path)
+    splitter = _build_splitter()
+    chunks: list[Document] = []
 
-    # 段落文本（跳过空行，避免切分出大量空白块）
-    parts = [p.text.strip() for p in document.paragraphs if p.text.strip()]
-    # 表格按行取值，用制表符连接单元格，尽量保留行列关系
-    for table in document.tables:
-        for row in table.rows:
-            cells = [cell.text.strip() for cell in row.cells]
-            if any(cells):
-                parts.append("\t".join(cells))
+    for heading, text in _group_sections(_docx_blocks(document)):
+        for content in _section_to_chunks(splitter, heading, text):
+            chunks.append(Document(page_content=content, metadata={"page": 0}))
 
-    full_text = "\n".join(parts)
-    if not full_text:
+    if not chunks:
         logger.warning("Word 无可用文本内容：%s", file_path)
         return []
 
-    # 全文视为一个整体文档，切分参数与 PDF 完全一致
-    chunks = _build_splitter().split_documents(
-        [Document(page_content=full_text, metadata={})]
-    )
-
-    file_name = os.path.basename(file_path)
-    for chunk in chunks:
-        chunk.metadata = {
-            "source": normalize_source(file_path),
-            "file_name": file_name,
-            "page": 0,
-        }
-
-    logger.info("%s → %d 个分块", file_name, len(chunks))
+    _finalize_chunks(chunks, file_path)
+    logger.info("%s → %d 个分块", os.path.basename(file_path), len(chunks))
     return chunks
 
 

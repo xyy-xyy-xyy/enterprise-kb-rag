@@ -39,6 +39,7 @@ huggingface_hub==1.30.0
 hyperframe==6.1.0
 idna==3.19
 Jinja2==3.1.6
+jieba==0.42.1
 jsonpatch==1.33
 jsonpointer==3.1.1
 langchain==1.4.0
@@ -81,6 +82,7 @@ pytz==2026.3.post1
 pywin32==312
 PyYAML==6.0.3
 qdrant-client==1.19.0
+rank-bm25==0.2.2
 requests==2.34.2
 requests-toolbelt==1.0.0
 rich==15.0.0

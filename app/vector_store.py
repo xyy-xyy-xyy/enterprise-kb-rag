@@ -123,6 +123,16 @@ def get_indexed_sources(vectorstore) -> set[str]:
     return {d.metadata.get("source") for d in docs if d.metadata.get("source")}
 
 
+def get_all_documents() -> list[Document]:
+    """取出索引中的全量分块，供本地构建 BM25 索引使用。
+
+    仅索引元数据与正文，不重算向量；演示规模够用。
+    """
+    if config.VECTOR_BACKEND == "qdrant":
+        return _qdrant_get_all_documents()
+    return _faiss_get_all_documents()
+
+
 def reset_index() -> None:
     """删除索引（用于重建）。"""
     if config.VECTOR_BACKEND == "qdrant":
@@ -161,6 +171,17 @@ def _faiss_load():
     )
     logger.debug("已加载 FAISS 索引：%d 条向量。", vectorstore.index.ntotal)
     return vectorstore
+
+
+def _faiss_get_all_documents() -> list[Document]:
+    """FAISS 的分块都放在 docstore 里，直接取出来即可。"""
+    vectorstore = load_index()
+    try:
+        return list(vectorstore.docstore._dict.values())
+    except AttributeError:
+        # 不同 langchain 版本内部结构可能变化，降级为“BM25 无候选”而非报错
+        logger.warning("无法读取 FAISS 索引中的文档，BM25 召回将跳过。")
+        return []
 
 
 # ============================ Qdrant 后端 ============================
@@ -246,6 +267,32 @@ def _qdrant_get_sources(vectorstore) -> set[str]:
     except Exception as exc:
         logger.debug("读取 Qdrant 文档来源失败：%s", exc)
         return set()
+
+
+def _qdrant_get_all_documents() -> list[Document]:
+    if not _qdrant_collection_exists():
+        raise IndexNotReadyError(
+            f"Qdrant collection '{config.QDRANT_COLLECTION}' 不存在，"
+            f"请先运行 `python -m app.ingestion` 入库。"
+        )
+    client = _get_qdrant_client()
+    points, _ = client.scroll(
+        collection_name=config.QDRANT_COLLECTION,
+        limit=10000,
+        with_payload=True,
+        with_vectors=False,
+    )
+    documents = []
+    for point in points:
+        payload = point.payload or {}
+        content = payload.get("page_content")
+        if not content:
+            continue
+        # LangChain 的 payload 结构为 {page_content, metadata}
+        documents.append(
+            Document(page_content=content, metadata=payload.get("metadata") or {})
+        )
+    return documents
 
 
 def _qdrant_reset():

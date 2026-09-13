@@ -15,10 +15,13 @@
 |---|---|
 | 文档解析 | PDF 用 PyMuPDF 逐页提取（页码 1-based）；Word(.docx) 用 python-docx 提取段落与表格文本 |
 | 文档分块 | `RecursiveCharacterTextSplitter`，chunk_size=500，overlap=50 |
+| 标题增强 | 启发式识别章节标题（章节号 / 数字编号 / 加粗短行），拼到该节每个分块的正文前，形如 `[标题] 第三章 报销流程` |
+| 分块标识 | 每个分块带全局唯一 `chunk_id`（`{file_name}_p{page}_{i}`），作为 RRF 融合的 key |
 | 向量化 | 通义千问 `text-embedding-v2`（中文效果好，无需本地下载模型） |
 | **双向量后端** | FAISS（本地文件，免 Docker）/ Qdrant（Docker 服务）通过 `.env` 一键切换 |
 | 增量入库 | 索引已存在时追加而非覆盖；已入库文件自动跳过 |
-| 检索问答 | 向量相似度检索 top-k → 拼接上下文 → 大模型生成 |
+| **混合检索** | 向量召回 + BM25 关键词召回（jieba 中文分词），RRF（k=60）融合，可用 `HYBRID_RETRIEVAL=false` 关闭 |
+| **Reranker 重排** | DashScope `qwen3-rerank` API 对 top-N 候选重排；API 失败自动降级为 RRF 顺序 |
 | 引用溯源 | 回答末尾自动列出来源文件名与页码，自动去重 |
 | 双入口 | FastAPI REST 接口 + Gradio 可视化界面（同一进程挂载） |
 | 失败回滚 | 上传采用临时文件中转，入库失败自动清理，不污染知识库 |
@@ -26,8 +29,6 @@
 ### 🔄 规划中（对应路线图阶段二 ~ 五）
 
 - 流式输出与多轮对话
-- 混合检索（向量 + BM25 关键词，RRF 融合）
-- BGE-Reranker 重排序
 - 查询改写（Query Rewrite）
 - **国密安全层**：SM4 文档加密存储 + SM3 完整性校验 + 内容去重
 - **RAG 质量评测体系**：Hit Rate / MRR / LLM-as-judge 对比实验
@@ -42,6 +43,8 @@
 | 编排框架 | LangChain 1.4 | 主流 LLM 应用框架 |
 | 向量库 | **FAISS + Qdrant 双后端** | FAISS 免 Docker 即开即用；Qdrant 生产级、支持服务端部署 |
 | Embedding | DashScope `text-embedding-v2` | 中文效果好，API 调用免本地下载 |
+| 关键词检索 | jieba + rank-bm25 | 中文分词是 BM25 生效的前提 |
+| 重排序 | DashScope `qwen3-rerank` | API 调用免下载约 2GB 本地重排模型 |
 | 大模型 | 通义千问 `qwen-plus` | 国内可用，API 成本低 |
 | 文档解析 | PyMuPDF + python-docx | 轻量，PDF 逐页 / Word 段落表格 |
 | 后端 | FastAPI | 异步支持，自带 Swagger 文档 |
@@ -103,7 +106,18 @@ VECTOR_BACKEND=qdrant
 QDRANT_HOST=localhost
 QDRANT_PORT=6333
 QDRANT_COLLECTION=enterprise_kb
+
+# 检索：混合检索（向量 + BM25，RRF 融合）与 Reranker 重排
+HYBRID_RETRIEVAL=true
+RERANK_ENABLED=true
+RERANK_TOP_N=10
+RERANK_MODEL=qwen3-rerank
 ```
+
+> **关于 Reranker**：走 DashScope API（`TextReRank`），不下载本地模型。
+> `gte-rerank` 已于 2026-05-30 下线，默认改用官方迁移目标 `qwen3-rerank`；
+> 模型名通过 `RERANK_MODEL` 配置，后续如有变更改 `.env` 一行即可，无需改代码。
+> API 调用失败会自动降级为 RRF 融合结果，不中断问答。
 
 > 使用 Qdrant 后端时，启动服务前请先确保 Docker 中的 Qdrant 在运行：
 > ```bash
@@ -160,7 +174,7 @@ curl -X POST http://localhost:8000/api/ask \
 {
   "answer": "……",
   "sources": [
-    { "file_name": "example.pdf", "page": 3, "snippet": "……" }
+    { "file_name": "example.pdf", "page": 3, "chunk_id": "example.pdf_p3_7", "snippet": "……" }
   ]
 }
 ```
