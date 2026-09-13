@@ -40,16 +40,20 @@ def health() -> dict:
 
 @app.post("/api/ingest")
 async def api_ingest(file: UploadFile = File(...)) -> dict:
-    """上传 PDF 并入库。"""
-    if not (file.filename or "").lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="仅支持 PDF 文件。")
+    """上传文档（.pdf / .docx）并入库。"""
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in ingestion.SUPPORTED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"仅支持 {' / '.join(ingestion.SUPPORTED_EXTENSIONS)} 文件。",
+        )
 
     os.makedirs(config.DOCS_PATH, exist_ok=True)
     target = os.path.join(config.DOCS_PATH, os.path.basename(file.filename))
     existed_before = os.path.exists(target)
 
     # 先写临时文件，完整接收后再落位，避免半个文件污染知识库目录
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=ext)
     os.close(tmp_fd)
     try:
         with open(tmp_path, "wb") as f:
@@ -58,7 +62,7 @@ async def api_ingest(file: UploadFile = File(...)) -> dict:
         # 否则临时路径会写进索引，既导致重复上传无法去重，也留下失效引用
         shutil.move(tmp_path, target)
         try:
-            chunks = ingestion.ingest_pdf(target)
+            chunks = ingestion.ingest_file(target)
         except Exception:
             # 入库失败则回滚，不留下未入库的文件
             if not existed_before and os.path.exists(target):
@@ -96,7 +100,12 @@ def _format_answer(result: dict) -> str:
             if key in seen:
                 continue
             seen.add(key)
-            lines.append(f"- **{s.get('file_name')}** 第 {s.get('page')} 页")
+            # Word 没有页码（page=0），不显示“第 0 页”，只留文件名
+            page = s.get("page")
+            lines.append(
+                f"- **{s.get('file_name')}**"
+                + (f" 第 {page} 页" if page else "")
+            )
         parts.append("\n\n---\n**参考来源**\n" + "\n".join(lines))
     return "\n".join(parts)
 
@@ -115,9 +124,9 @@ def ui_ask(question: str):
 
 
 def ui_ingest(files):
-    """Gradio 上传回调，支持一次选择多个 PDF。"""
+    """Gradio 上传回调，支持一次选择多个文档（.pdf / .docx）。"""
     if not files:
-        return "请先选择 PDF 文件。"
+        return "请先选择文档（.pdf / .docx）。"
     if isinstance(files, str):
         files = [files]
 
@@ -130,7 +139,7 @@ def ui_ingest(files):
             # 同 API：先落到知识库目录，再入库，保证索引里的 source 是最终路径
             if os.path.abspath(path) != os.path.abspath(target):
                 shutil.copy2(path, target)
-            chunks = ingestion.ingest_pdf(target)
+            chunks = ingestion.ingest_file(target)
             total += chunks
             if chunks:
                 messages.append(f"- ✅ {name}：新增 {chunks} 个分块")
@@ -146,7 +155,7 @@ def build_ui() -> gr.Blocks:
     with gr.Blocks(title="企业知识库问答", theme=gr.themes.Soft()) as demo:
         gr.Markdown(
             "# 企业知识库问答\n"
-            "上传 PDF 建立知识库，然后基于文档内容提问，回答会自动附带来源与页码。"
+            "上传 PDF / Word 文档建立知识库，然后基于文档内容提问，回答会自动附带来源与页码。"
         )
         with gr.Tabs():
             with gr.Tab("知识问答"):
@@ -164,11 +173,13 @@ def build_ui() -> gr.Blocks:
                 clear_btn.click(lambda: ("", ""), outputs=[question, answer])
 
             with gr.Tab("文档入库"):
-                gr.Markdown("上传 PDF 文档，系统会自动分块、向量化并写入向量索引。")
+                gr.Markdown(
+                    "上传 PDF / Word(.docx) 文档，系统会自动分块、向量化并写入向量索引。"
+                )
                 uploader = gr.File(
-                    label="选择 PDF（可多选）",
+                    label="选择文档（可多选）",
                     file_count="multiple",
-                    file_types=[".pdf"],
+                    file_types=[".pdf", ".docx"],
                     type="filepath",
                 )
                 ingest_btn = gr.Button("开始入库", variant="primary")

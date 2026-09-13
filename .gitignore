@@ -5,6 +5,7 @@ __pycache__/
 data/faiss_index/
 data/qdrant_storage/
 data/docs/*.pdf
+data/docs/*.docx
 data/_*
 !.gitkeep
 .workbuddy/

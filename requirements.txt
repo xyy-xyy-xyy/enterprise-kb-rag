@@ -52,6 +52,7 @@ langgraph-checkpoint==4.2.0
 langgraph-prebuilt==1.1.0
 langgraph-sdk==0.4.4
 langsmith==0.12.2
+lxml==6.1.3
 markdown-it-py==4.2.0
 MarkupSafe==3.0.3
 mdurl==0.1.2
@@ -73,6 +74,7 @@ pydub==0.25.1
 Pygments==2.21.0
 pymupdf==1.28.2
 python-dateutil==2.9.0.post0
+python-docx==1.2.0
 python-dotenv==1.2.3
 python-multipart==0.0.32
 pytz==2026.3.post1

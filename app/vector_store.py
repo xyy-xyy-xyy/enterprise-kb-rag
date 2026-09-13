@@ -227,15 +227,18 @@ def _qdrant_load():
 def _qdrant_get_sources(vectorstore) -> set[str]:
     try:
         client = _get_qdrant_client()
+        # 必须取 payload，否则 point.payload 为 None，去重会永远失效；
+        # 只取 metadata.source 一个字段，避免把全部正文都拉回来
         points, _ = client.scroll(
             collection_name=config.QDRANT_COLLECTION,
             limit=10000,
-            with_payload=False,
+            with_payload=["metadata.source"],
             with_vectors=False,
         )
         sources = set()
         for point in points:
-            meta = point.payload or {}
+            # LangChain 写入的 payload 为 {page_content, metadata}，source 在 metadata 里
+            meta = (point.payload or {}).get("metadata") or {}
             src = meta.get("source")
             if src:
                 sources.add(src)

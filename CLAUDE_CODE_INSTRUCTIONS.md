@@ -2,14 +2,14 @@
 
 ## 项目概述
 
-构建一个基于 RAG（检索增强生成）的企业知识库问答系统。用户上传 PDF 文档，系统将其分块、向量化并存储到 FAISS，用户提问时检索相关片段，调用大模型生成带引用来源的回答。
+构建一个基于 RAG（检索增强生成）的企业知识库问答系统。用户上传 PDF / Word(.docx) 文档，系统将其分块、向量化并存储到向量索引（FAISS 或 Qdrant 双后端），用户提问时检索相关片段，调用大模型生成带引用来源的回答。
 
 ## 技术栈
 
 - **向量数据库**：FAISS（本地文件型，不需要 Docker）
 - **LLM**：通义千问 qwen-plus（通过阿里云 DashScope API 调用）
 - **Embedding**：DashScope text-embedding-v2
-- **文档解析**：PyMuPDF（fitz）
+- **文档解析**：PDF 用 PyMuPDF（fitz）；Word(.docx) 用 python-docx
 - **框架**：LangChain 1.4.0 + langchain-community 0.4.2
 - **API**：FastAPI
 - **Web UI**：Gradio（简易问答界面）
@@ -43,6 +43,7 @@ from langchain_community.vectorstores import FAISS
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import faiss  # faiss-cpu 1.15.0
+import docx  # python-docx 1.2.0
 ```
 
 ## 目标项目结构
@@ -53,11 +54,11 @@ enterprise-kb-rag/
 │   ├── __init__.py
 │   ├── config.py          # 读取 .env，集中管理配置
 │   ├── vector_store.py    # FAISS 索引的创建/保存/加载/检索
-│   ├── ingestion.py       # PDF → 分块 → 向量化 → 存 FAISS
+│   ├── ingestion.py       # 文档(PDF/Word) → 分块 → 向量化 → 入库
 │   ├── retrieval.py       # 检索 → 拼 prompt → 调 LLM → 返回答案+来源
 │   └── main.py            # FastAPI 入口 + Gradio UI
 ├── data/
-│   ├── docs/              # 放知识库 PDF 文档（用户手动放）
+│   ├── docs/              # 放知识库 PDF/Word 文档（用户手动放）
 │   └── faiss_index/       # FAISS 索引文件（自动生成）
 ├── .env                   # 已就绪
 ├── .gitignore             # 已就绪
@@ -103,11 +104,11 @@ DOCS_DIR = "data/docs"
 
 ### 3. app/ingestion.py
 
-PDF 文档入库流程：加载 → 分块 → 向量化 → 存 FAISS。
+文档（PDF/Word）入库流程：加载 → 分块 → 向量化 → 存向量索引。
 
 关键函数：
-- `ingest_pdf(file_path)` → 对单个 PDF 执行完整入库流程
-- `ingest_directory(dir_path)` → 遍历 `data/docs/` 下所有 .pdf 文件批量入库
+- `ingest_file(file_path)` → 对单个文档（PDF/Word）执行完整入库流程（ingest_pdf 为其兼容别名）
+- `ingest_directory(dir_path)` → 遍历 `data/docs/` 下所有 .pdf / .docx 文件批量入库
 
 流程细节：
 1. `PyMuPDFLoader(file_path).load()` 加载 PDF，得到 `List[Document]`（每个 Document 是一页）
@@ -159,14 +160,14 @@ if __name__ == "__main__":
 FastAPI API + Gradio 界面，两种访问方式。
 
 FastAPI 路由：
-- `POST /api/ingest` → 接收上传的 PDF 文件，调用 `ingestion.ingest_pdf()` 入库，返回 `{"status": "success", "chunks": count}`
+- `POST /api/ingest` → 接收上传的 PDF/Word 文件，调用 `ingestion.ingest_file()` 入库，返回 `{"status": "success", "chunks": count}`
 - `POST /api/ask` → 接收 `{"question": "..."}`，调用 `retrieval.answer_question()`，返回 `{"answer": "...", "sources": [...]}`
 - `GET /api/health` → 健康检查
 
 Gradio 界面（用 `gr.mount_gradio_app` 挂载到 FastAPI，或用 `app = gr.routes`）：
 - 一个文本输入框：提问
 - 一个输出区：显示答案 + 来源引用
-- 可选：文件上传组件用于上传 PDF
+- 可选：文件上传组件用于上传 PDF / Word
 
 启动方式：
 ```bash
@@ -188,7 +189,7 @@ python -m app.ingestion   # 扫描 data/docs/ 建/更新索引
 
 ## 验收标准
 
-- [ ] `python -m app.ingestion` 能扫描 data/docs/ 下 PDF 并建索引
+- [ ] `python -m app.ingestion` 能扫描 data/docs/ 下 PDF/Word 并建索引
 - [ ] `uvicorn app.main:app` 启动后，POST /api/ask 能返回带来源的答案
 - [ ] Gradio 界面能输入问题、显示答案和来源
 - [ ] 没有 API Key 硬编码
@@ -201,5 +202,5 @@ python -m app.ingestion   # 扫描 data/docs/ 建/更新索引
 3. `ingestion.py`（PyMuPDF + 分块 + 建索引，10 分钟）
 4. `retrieval.py`（检索 + prompt + LLM 调用，10 分钟）
 5. `main.py`（FastAPI 路由 + Gradio UI，10 分钟）
-6. 往 data/docs/ 放一份 PDF，跑 `python -m app.ingestion` 建索引
+6. 往 data/docs/ 放一份 PDF 或 Word，跑 `python -m app.ingestion` 建索引
 7. 启动服务，提问，验证答案带来源引用

@@ -1,6 +1,6 @@
 # EnterpriseKB — 企业知识库智能问答系统
 
-基于 **RAG（检索增强生成）** 的企业知识库问答系统。上传 PDF 文档，系统自动完成解析、分块、向量化与索引构建；提问时检索相关片段，交由大模型生成**带引用来源与页码**的回答。
+基于 **RAG（检索增强生成）** 的企业知识库问答系统。上传 PDF / Word(.docx) 文档，系统自动完成解析、分块、向量化与索引构建；提问时检索相关片段，交由大模型生成**带引用来源与页码**的回答。
 
 > **当前状态**：阶段一（最小可用 RAG 链路）已完成；阶段二（核心功能完善）进行中。
 > 详细实施计划与进度见 [`路线图进度.md`](路线图进度.md)。
@@ -13,7 +13,7 @@
 
 | 功能 | 说明 |
 |---|---|
-| PDF 解析 | PyMuPDF 逐页提取文本，页码自动转为 1-based（人类可读页码） |
+| 文档解析 | PDF 用 PyMuPDF 逐页提取（页码 1-based）；Word(.docx) 用 python-docx 提取段落与表格文本 |
 | 文档分块 | `RecursiveCharacterTextSplitter`，chunk_size=500，overlap=50 |
 | 向量化 | 通义千问 `text-embedding-v2`（中文效果好，无需本地下载模型） |
 | **双向量后端** | FAISS（本地文件，免 Docker）/ Qdrant（Docker 服务）通过 `.env` 一键切换 |
@@ -43,7 +43,7 @@
 | 向量库 | **FAISS + Qdrant 双后端** | FAISS 免 Docker 即开即用；Qdrant 生产级、支持服务端部署 |
 | Embedding | DashScope `text-embedding-v2` | 中文效果好，API 调用免本地下载 |
 | 大模型 | 通义千问 `qwen-plus` | 国内可用，API 成本低 |
-| 文档解析 | PyMuPDF | 轻量，PDF 解析质量好 |
+| 文档解析 | PyMuPDF + python-docx | 轻量，PDF 逐页 / Word 段落表格 |
 | 后端 | FastAPI | 异步支持，自带 Swagger 文档 |
 | 界面 | Gradio 6 | 快速搭建演示界面 |
 
@@ -57,7 +57,7 @@
 
 ```mermaid
 flowchart LR
-    A[PDF 文档<br/>data/docs] --> B[PyMuPDF 解析]
+    A[PDF / Word 文档<br/>data/docs] --> B[解析分块]
     B --> C[RecursiveCharacterTextSplitter 分块]
     C --> D[DashScope text-embedding-v2 向量化]
     D --> E[(向量索引<br/>FAISS 或 Qdrant)]
@@ -114,7 +114,7 @@ QDRANT_COLLECTION=enterprise_kb
 
 ### 3. 构建索引
 
-把 PDF 放入 `data/docs/`（仓库不收录 PDF，请自行放入文档），然后执行：
+把 PDF / Word(.docx) 文档放入 `data/docs/`（仓库不收录文档，请自行放入），然后执行：
 
 ```bash
 venv\Scripts\python.exe -m app.ingestion
@@ -143,7 +143,7 @@ Windows 用户也可以直接双击 `启动服务.bat`（会检查索引并启�
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/health` | 健康检查，返回模型名、后端类型与索引状态 |
-| POST | `/api/ingest` | 上传 PDF 并入库（multipart/form-data） |
+| POST | `/api/ingest` | 上传 PDF / Word 并入库（multipart/form-data） |
 | POST | `/api/ask` | 提问，返回答案与来源列表 |
 
 示例：
@@ -174,11 +174,11 @@ enterprise-kb-rag/
 ├── app/
 │   ├── config.py          # 环境变量与全局配置、日志初始化
 │   ├── vector_store.py    # 向量索引（FAISS + Qdrant 双后端抽象层）
-│   ├── ingestion.py       # PDF → 分块 → 向量化 → 入库（含去重与回滚）
+│   ├── ingestion.py       # 文档(PDF/Word) → 分块 → 向量化 → 入库（含去重与回滚）
 │   ├── retrieval.py       # 检索 → 拼装 Prompt → 调用 LLM → 返回答案与来源
 │   └── main.py            # FastAPI 路由 + Gradio 界面挂载
 ├── data/
-│   └── docs/              # 知识库原始 PDF（自行放入，不纳入 Git）
+│   └── docs/              # 知识库原始文档 PDF/Word（自行放入，不纳入 Git）
 ├── 启动服务.bat            # Windows 一键启动脚本
 ├── 路线图进度.md           # 分阶段实施进度与执行说明
 ├── requirements.txt
@@ -212,7 +212,7 @@ enterprise-kb-rag/
 
 ## 已知限制
 
-- 当前仅支持 PDF，未支持 Word / Markdown。
+- 当前支持 PDF 与 Word(.docx)；尚未支持 Markdown、扫描件图片（图片内文字读不到）。
 - 重复入库判断基于**归一化文件路径**：同一份 PDF 改名后重传会被当成新文档重复入库（计划用 SM3 内容摘要替代，顺便兼做完整性校验）。
 - 不支持文档删除：删除 `data/docs/` 中的文件后，索引里的分块不会同步移除（需 `--rebuild` 重建）。
 - 单次提问无上下文记忆，暂不支持多轮对话（阶段二规划）。
