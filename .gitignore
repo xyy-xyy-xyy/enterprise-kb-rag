@@ -10,3 +10,7 @@ data/_*
 .workbuddy/
 *.egg-info/
 .pytest_cache/
+
+# 内部规划文档，仅留本地，不推送到公开仓库
+路线图进度.md
+ClaudeCode分工清单.md
