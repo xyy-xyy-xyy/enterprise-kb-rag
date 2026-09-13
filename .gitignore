@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+.env
+data/faiss_index/
+data/qdrant_storage/
+data/docs/*.pdf
+data/_*
+!.gitkeep
+.workbuddy/
+*.egg-info/
+.pytest_cache/
