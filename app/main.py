@@ -1,5 +1,6 @@
 """FastAPI 接口 + Gradio 问答界面。"""
 
+import json
 import logging
 import os
 import shutil
@@ -7,6 +8,7 @@ import tempfile
 
 import gradio as gr
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app import config, ingestion, retrieval, vector_store
@@ -79,48 +81,96 @@ async def api_ingest(file: UploadFile = File(...)) -> dict:
 
 @app.post("/api/ask")
 def api_ask(payload: AskRequest) -> dict:
-    """提问并返回答案与来源。"""
+    """提问并返回答案与来源（一次性返回）。"""
     try:
         return retrieval.answer_question(payload.question, k=payload.k)
     except vector_store.IndexNotReadyError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+@app.post("/api/ask/stream")
+def api_ask_stream(payload: AskRequest):
+    """提问并以 SSE 流式返回：每行 data: {...JSON...}，结束为 data: [DONE]。
+
+    事件格式与 retrieval.stream_answer 一致（sources / delta / done / error）。
+    用 curl 观察：curl -N -X POST localhost:8000/api/ask/stream \
+        -H "Content-Type: application/json" -d '{"question":"..."}'
+    """
+
+    def event_stream():
+        for event in retrieval.stream_answer(payload.question, k=payload.k):
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 # ----------------------------- Gradio UI -----------------------------
+
+
+def _sources_markdown(sources) -> str:
+    """把来源渲染成 Markdown 列表（同文件同页只显示一次）。"""
+    if not sources:
+        return ""
+    seen, lines = set(), []
+    for s in sources:
+        key = (s.get("file_name"), s.get("page"))
+        if key in seen:
+            continue
+        seen.add(key)
+        # Word 没有页码（page=0），不显示“第 0 页”，只留文件名
+        page = s.get("page")
+        lines.append(
+            f"- **{s.get('file_name')}**"
+            + (f" 第 {page} 页" if page else "")
+        )
+    return "\n\n---\n**参考来源**\n" + "\n".join(lines)
 
 
 def _format_answer(result: dict) -> str:
     """把回答和来源渲染成 Markdown。"""
-    parts = [result.get("answer", "")]
-    sources = result.get("sources") or []
-    if sources:
-        seen, lines = set(), []
-        for s in sources:
-            key = (s.get("file_name"), s.get("page"))
-            if key in seen:
-                continue
-            seen.add(key)
-            # Word 没有页码（page=0），不显示“第 0 页”，只留文件名
-            page = s.get("page")
-            lines.append(
-                f"- **{s.get('file_name')}**"
-                + (f" 第 {page} 页" if page else "")
-            )
-        parts.append("\n\n---\n**参考来源**\n" + "\n".join(lines))
-    return "\n".join(parts)
+    return (result.get("answer", "") or "") + _sources_markdown(result.get("sources"))
 
 
 def ui_ask(question: str):
-    """Gradio 提问回调。"""
+    """Gradio 提问回调：生成器形式，Gradio 会把每次 yield 渲染成打字机效果。
+
+    流程：先显示检索中 → 拿到来源后立刻显示"已检索到 N 个片段" →
+    答案随 LLM 增量逐段追加 → 结束后附参考来源。
+    """
     if not question or not question.strip():
-        return "请输入问题。"
-    try:
-        return _format_answer(retrieval.answer_question(question))
-    except vector_store.IndexNotReadyError as exc:
-        return f"⚠️ {exc}"
-    except Exception as exc:
-        logger.exception("问答失败。")
-        return f"⚠️ 处理失败：{exc}"
+        yield "请输入问题。"
+        return
+
+    head, sources_md, answer = "⏳ 正在检索知识库…", "", ""
+    yield head
+
+    for event in retrieval.stream_answer(question):
+        etype = event.get("type")
+
+        if etype == "sources":
+            sources = event.get("sources") or []
+            sources_md = _sources_markdown(sources)
+            head = f"✅ 已检索到 {len(sources)} 个参考片段"
+            yield f"{head}\n\n{sources_md}".rstrip()
+
+        elif etype == "delta":
+            answer += event.get("text", "")
+            yield f"{head}\n\n{answer}{sources_md}"
+
+        elif etype == "error":
+            # 已吐出的答案不回滚，只在后面补一句提示
+            tail = f"\n\n⚠️ {event.get('message', '处理失败。')}"
+            yield (f"{head}\n\n{answer}{tail}{sources_md}" if answer else f"⚠️ {event.get('message', '处理失败。')}")
+            return
+
+        elif etype == "done":
+            answer = event.get("answer", answer)
+            yield f"{head}\n\n{answer}{sources_md}"
 
 
 def ui_ingest(files):
@@ -152,7 +202,11 @@ def ui_ingest(files):
 
 
 def build_ui() -> gr.Blocks:
-    with gr.Blocks(title="企业知识库问答", theme=gr.themes.Soft()) as demo:
+    # 开启队列：Gradio 只有在队列模式下才会把生成器函数的每次 yield 推给前端，
+    # 否则会等生成器跑完再一次性渲染，打字机效果就没了。
+    demo = gr.Blocks(title="企业知识库问答")
+    demo.queue()
+    with demo:
         gr.Markdown(
             "# 企业知识库问答\n"
             "上传 PDF / Word 文档建立知识库，然后基于文档内容提问，回答会自动附带来源与页码。"
@@ -189,7 +243,8 @@ def build_ui() -> gr.Blocks:
 
 
 # 把 Gradio 挂到 FastAPI 的根路径；/api/* 路由已先行注册，不受影响
-app = gr.mount_gradio_app(app, build_ui(), path="/")
+# 主题要传给 launch 而非 Blocks 构造函数（Gradio 6 起后者会告警）
+app = gr.mount_gradio_app(app, build_ui(), path="/", theme=gr.themes.Soft())
 
 
 if __name__ == "__main__":

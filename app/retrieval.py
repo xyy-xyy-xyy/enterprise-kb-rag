@@ -5,6 +5,7 @@ HYBRID_RETRIEVAL=false 时可退回纯向量检索，便于对照实验与回归
 
 import hashlib
 import logging
+from collections.abc import Iterator
 
 import jieba
 from dashscope import TextReRank
@@ -38,15 +39,21 @@ _llm = None
 
 
 def get_llm() -> ChatTongyi:
-    """返回通义千问模型实例（进程内复用）。"""
+    """返回通义千问模型实例（进程内复用）。
+
+    必须显式 streaming=True：ChatTongyi 默认 streaming=False，此时 .stream()
+    会退化成"生成完整段后一次性返回"（实测只有 1 个 chunk），前端看不到打字机效果。
+    打开后 .stream() 才会逐 token 吐出（实测 50+ chunk）。
+    """
     global _llm
     if _llm is None:
         config.validate()
         _llm = ChatTongyi(
             model_name=config.LLM_MODEL,
             dashscope_api_key=config.DASHSCOPE_API_KEY,
+            streaming=True,
         )
-        logger.debug("已初始化 LLM %s", config.LLM_MODEL)
+        logger.debug("已初始化 LLM %s（streaming=True）", config.LLM_MODEL)
     return _llm
 
 
@@ -229,6 +236,21 @@ def _to_sources(results) -> list[dict]:
     ]
 
 
+def _prepare_prompt(question: str, k: int) -> tuple[str, list[dict]]:
+    """检索 → 拼装 prompt，返回 (prompt, sources)。
+
+    无命中时返回 ("", [])：此时不发请求，直接用兜底文案。
+    """
+    results = hybrid_search(question, k=k)
+    if not results:
+        logger.info("检索无结果，直接返回兜底回答。")
+        return "", []
+    return (
+        PROMPT_TEMPLATE.format(context=_build_context(results), question=question),
+        _to_sources(results),
+    )
+
+
 def answer_question(question: str, k: int = None) -> dict:
     """检索并生成回答，返回 {"answer": str, "sources": List[dict]}。
 
@@ -240,13 +262,9 @@ def answer_question(question: str, k: int = None) -> dict:
     if not question or not question.strip():
         return {"answer": "请输入问题。", "sources": []}
 
-    results = hybrid_search(question, k=k)
-    if not results:
-        logger.info("检索无结果，直接返回兜底回答。")
+    prompt, sources = _prepare_prompt(question, k)
+    if not prompt:
         return {"answer": NO_RESULT_ANSWER, "sources": []}
-
-    context = _build_context(results)
-    prompt = PROMPT_TEMPLATE.format(context=context, question=question)
 
     try:
         response = get_llm().invoke([HumanMessage(content=prompt)])
@@ -254,8 +272,61 @@ def answer_question(question: str, k: int = None) -> dict:
         logger.exception("调用 LLM 失败。")
         return {
             "answer": "调用大模型失败，请稍后重试或检查 DASHSCOPE_API_KEY 与网络。",
-            "sources": _to_sources(results),
+            "sources": sources,
         }
 
-    logger.info("已生成回答（参考 %d 个片段）。", len(results))
-    return {"answer": response.content, "sources": _to_sources(results)}
+    logger.info("已生成回答（参考 %d 个片段）。", len(sources))
+    return {"answer": response.content, "sources": sources}
+
+
+def stream_answer(question: str, k: int = None) -> Iterator[dict]:
+    """流式问答：以事件形式产出，供 Gradio 打字机效果与 SSE 接口共用。
+
+    事件类型：
+        {"type": "sources", "sources": [...]}  检索完成，先把来源交给前端
+        {"type": "delta",   "text": "..."}     逐 token 增量文本
+        {"type": "done",    "answer": str, "sources": [...]}
+        {"type": "error",   "message": str}    检索或生成失败（已吐出的文本不回滚）
+
+    与 answer_question 共用 _prepare_prompt，保证两条路径的检索行为完全一致。
+    """
+    config.setup_logging()
+    k = k or config.TOP_K
+
+    if not question or not question.strip():
+        yield {"type": "error", "message": "请输入问题。"}
+        return
+
+    try:
+        prompt, sources = _prepare_prompt(question, k)
+    except vector_store.IndexNotReadyError as exc:
+        yield {"type": "error", "message": str(exc)}
+        return
+    except Exception as exc:
+        logger.exception("检索失败。")
+        yield {"type": "error", "message": f"检索失败：{exc}"}
+        return
+
+    if not prompt:
+        yield {"type": "delta", "text": NO_RESULT_ANSWER}
+        yield {"type": "done", "answer": NO_RESULT_ANSWER, "sources": []}
+        return
+
+    yield {"type": "sources", "sources": sources}
+
+    parts: list[str] = []
+    try:
+        for chunk in get_llm().stream([HumanMessage(content=prompt)]):
+            text = chunk.content or ""
+            if not text:
+                continue
+            parts.append(text)
+            yield {"type": "delta", "text": text}
+    except Exception:
+        logger.exception("流式调用 LLM 失败。")
+        yield {"type": "error", "message": "⚠️ 生成中断，请稍后重试。"}
+        return
+
+    answer = "".join(parts)
+    logger.info("已流式生成回答（参考 %d 个片段，%d 个增量块）。", len(sources), len(parts))
+    yield {"type": "done", "answer": answer, "sources": sources}

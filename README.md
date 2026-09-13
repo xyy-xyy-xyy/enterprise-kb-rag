@@ -28,7 +28,7 @@
 
 ### 🔄 规划中（对应路线图阶段二 ~ 五）
 
-- 流式输出与多轮对话
+- 多轮对话
 - 查询改写（Query Rewrite）
 - **国密安全层**：SM4 文档加密存储 + SM3 完整性校验 + 内容去重
 - **RAG 质量评测体系**：Hit Rate / MRR / LLM-as-judge 对比实验
@@ -149,6 +149,7 @@ venv\Scripts\python.exe -m uvicorn app.main:app --port 8000 --reload
 Windows 用户也可以直接双击 `启动服务.bat`（会检查索引并启动；Qdrant 模式下请先确保 Docker 中 Qdrant 已运行）。
 
 浏览器打开 <http://localhost:8000> 使用 Gradio 界面（知识问答 + 文档入库两个 Tab）。
+知识问答为流式输出：先显示"已检索到 N 个参考片段"，答案逐字追加，结束后列出参考来源。
 
 ---
 
@@ -158,7 +159,8 @@ Windows 用户也可以直接双击 `启动服务.bat`（会检查索引并启�
 |---|---|---|
 | GET | `/api/health` | 健康检查，返回模型名、后端类型与索引状态 |
 | POST | `/api/ingest` | 上传 PDF / Word 并入库（multipart/form-data） |
-| POST | `/api/ask` | 提问，返回答案与来源列表 |
+| POST | `/api/ask` | 提问，返回答案与来源列表（等待完整生成后一次性返回） |
+| POST | `/api/ask/stream` | 提问，**SSE 流式返回**（`sources` → 多个 `delta` → `done`，结束发 `data: [DONE]`） |
 
 示例：
 
@@ -178,6 +180,27 @@ curl -X POST http://localhost:8000/api/ask \
   ]
 }
 ```
+
+### 流式接口（SSE）
+
+```bash
+curl -N -X POST http://localhost:8000/api/ask/stream \
+  -H "Content-Type: application/json" \
+  -d "{\"question\": \"差旅住宿费的报销标准是什么？\"}"
+```
+
+每行一个事件（JSON），前端按 `type` 处理即可：
+
+```
+data: {"type": "sources", "sources": [{ "file_name": "...", "page": 0, "snippet": "..." }]}
+data: {"type": "delta", "text": "一线城市"}
+data: {"type": "delta", "text": "住宿费上限"}
+data: {"type": "done", "answer": "……", "sources": [...]}
+data: [DONE]
+```
+
+> 实现要点：`ChatTongyi` 默认 `streaming=False`，此时 `.stream()` 会退化成"生成完一次性返回"（实测仅 1 个 chunk），
+> 必须显式传 `streaming=True` 才会逐 token 吐出；Gradio 侧需 `demo.queue()` 才会把每次 yield 推送到前端。
 
 ---
 
@@ -217,7 +240,7 @@ enterprise-kb-rag/
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | 一 | 环境搭建与最小 RAG 链路（双后端可用） | ✅ 完成 |
-| 二 | 流式输出、混合检索、Reranker、多轮对话 | 🔄 进行中 |
+| 二 | 混合检索、Reranker、流式输出（已完成）；多轮对话待做 | 🔄 进行中 |
 | 三 | 国密安全层（SM4 加密 + SM3 校验 + 内容去重） | ⬜ 待开始 |
 | 四 | RAG 质量评测体系（Hit Rate / MRR / LLM-judge） | ⬜ 待开始 |
 | 五 | 单元测试、CI、Docker 部署、文档与演示材料 | ⬜ 待开始 |
@@ -230,6 +253,7 @@ enterprise-kb-rag/
 - 重复入库判断基于**归一化文件路径**：同一份 PDF 改名后重传会被当成新文档重复入库（计划用 SM3 内容摘要替代，顺便兼做完整性校验）。
 - 不支持文档删除：删除 `data/docs/` 中的文件后，索引里的分块不会同步移除（需 `--rebuild` 重建）。
 - 单次提问无上下文记忆，暂不支持多轮对话（阶段二规划）。
+- 流式输出为同步生成器实现，`/api/ask/stream` 每次请求占用一个线程（当前知识库规模下无压力）。
 - Qdrant 后端依赖 Docker 服务运行；服务未启动时报错而非静默降级。
 
 ---
