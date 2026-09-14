@@ -49,6 +49,7 @@ langchain-classic==1.0.8
 langchain-community==0.4.2
 langchain-core==1.6.2
 langchain-protocol==0.0.19
+langchain-qdrant==1.1.0
 langchain-text-splitters==1.1.2
 langgraph==1.2.11
 langgraph-checkpoint==4.2.0

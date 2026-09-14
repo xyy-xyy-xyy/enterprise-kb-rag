@@ -243,8 +243,29 @@ def _qdrant_collection_exists() -> bool:
         return False
 
 
+def _qdrant_vector_store_class():
+    """延迟导入 langchain_qdrant —— 只有真的用 Qdrant 后端时才需要这个包。
+
+    为什么不做顶层导入：FAISS 后端（默认）完全不需要它，顶层导入会让
+    `import app.vector_store` 在只装了 `qdrant-client` 的环境里直接失败。
+
+    为什么把 ImportError 换成 RuntimeError：裸的 ModuleNotFoundError 指向的是
+    "某个模块没了"，而不是"环境没装齐"，排查时容易跑偏（阶段五 CI 就踩过一次：
+    requirements.txt 漏声明这个包 → 用例报出的却是"索引未就绪"，根因被藏住）。
+    这里刻意**不吞掉**这个错误，只是把提示换成能直接照做的动作。
+    """
+    try:
+        from langchain_qdrant import QdrantVectorStore
+    except ImportError as exc:
+        raise RuntimeError(
+            "缺少 langchain-qdrant 依赖，无法使用 Qdrant 后端；"
+            "请执行 `pip install -r requirements.txt` 后重试。"
+        ) from exc
+    return QdrantVectorStore
+
+
 def _qdrant_create(documents: list[Document]):
-    from langchain_qdrant import QdrantVectorStore
+    QdrantVectorStore = _qdrant_vector_store_class()
     from qdrant_client.models import Distance, VectorParams
 
     client = _get_qdrant_client()
@@ -266,7 +287,7 @@ def _qdrant_create(documents: list[Document]):
 
 
 def _qdrant_load():
-    from langchain_qdrant import QdrantVectorStore
+    QdrantVectorStore = _qdrant_vector_store_class()
 
     if not _qdrant_collection_exists():
         raise IndexNotReadyError(

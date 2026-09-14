@@ -4,7 +4,7 @@
 
 基于 **RAG（检索增强生成）** 的企业知识库问答系统。上传 PDF / Word(.docx) 文档，系统自动完成解析、分块、向量化与索引构建；提问时检索相关片段，交由大模型生成**带引用来源与定位（PDF 页码 / Word 段落号）**的回答。
 
-> **当前状态**：阶段一（最小可用 RAG 链路）、阶段二（核心功能完善：混合检索 / Reranker / 流式输出 / 多轮对话）、阶段三（国密安全层：SM4 加密存储 / SM3 完整性校验 / 内容去重）、阶段四（RAG 质量评测体系）、阶段五（工程化：336 个离线单元测试 / GitHub Actions CI / Docker 一键部署）已完成。
+> **当前状态**：阶段一（最小可用 RAG 链路）、阶段二（核心功能完善：混合检索 / Reranker / 流式输出 / 多轮对话）、阶段三（国密安全层：SM4 加密存储 / SM3 完整性校验 / 内容去重）、阶段四（RAG 质量评测体系）、阶段五（工程化：339 个离线单元测试 / GitHub Actions CI / Docker 一键部署）已完成。
 > 详细实施计划与进度见 [`路线图进度.md`](路线图进度.md)，安全设计边界见 [`SECURITY.md`](SECURITY.md)。
 
 ---
@@ -38,7 +38,7 @@
 
 | 能力 | 说明 |
 |---|---|
-| **自动化测试** | 336 个离线单元测试（`pytest -m "not integration"`），另有 10 个标记为 `integration` 的真实链路用例本地跑；CI 环境实测覆盖率 **76.20%** |
+| **自动化测试** | 339 个离线单元测试（`pytest -m "not integration"`），另有 10 个标记为 `integration` 的真实链路用例本地跑；CI 环境实测覆盖率 **76.25%** |
 | **持续集成** | GitHub Actions：每次 push / PR 自动装依赖、跑离线测试、校验覆盖率门槛（`--cov-fail-under=70`） |
 | **Docker 一键部署** | `Dockerfile` + `docker-compose.yml`（app + Qdrant 两个服务），`SM4_KEY` 未注入时**直接启动失败**并说明原因，避免容器读不了存量密文 |
 
@@ -526,7 +526,7 @@ enterprise-kb-rag/
 
 - 当前支持 PDF 与 Word(.docx)；尚未支持 Markdown、扫描件图片（图片内文字读不到）。
 - **CI 只跑离线单元测试**：`integration` 标记的用例需要真实 `DASHSCOPE_API_KEY` 与运行中的 Qdrant，只能在本地跑。CI 里的 `DASHSCOPE_API_KEY` 是一个假值，只为了让 `config.validate()` 不抛异常，**不会发出任何真实请求**（相关用例已全部标记跳过）。
-- 覆盖率基线为 CI 环境实测的 **76.20%**，其中 `app/vector_store.py` 的 Qdrant 分支、`app/eval/` 里需要调 LLM 的评测流程、`app/main.py` 的 Gradio 布局代码天然难以离线覆盖 —— 这些是真实缺口，没有用排除统计的方式修饰。
+- 覆盖率基线为 CI 环境实测的 **76.25%**，其中 `app/vector_store.py` 的 Qdrant 分支、`app/eval/` 里需要调 LLM 的评测流程、`app/main.py` 的 Gradio 布局代码天然难以离线覆盖 —— 这些是真实缺口，没有用排除统计的方式修饰。
 - 不支持文档删除：删除 `data/docs/` 中的文件后，索引里的分块不会同步移除（需 `--rebuild` 重建）。
 - 同一份文档**改了内容但保持同名**时，仍会被 `source` 去重拦下（既有行为，未改成覆盖更新），需要先做文档删除才能重新入库 —— 这也是上一条的连带影响。
 

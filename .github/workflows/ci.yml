@@ -19,6 +19,10 @@ jobs:
           cache: 'pip'
 
       - name: 安装依赖
+        # 这一步是全仓库唯一"全新环境"的验证点：本机 venv 里多装的包会掩盖
+        # requirements.txt 的漏声明，只有在这里装一次才会暴露（阶段五 CI 就栽过：
+        # 本机装了 langchain-qdrant、requirements.txt 却没写 → 全新环境 ImportError）。
+        # 改依赖后请用 `pip freeze` 与 requirements.txt 做一次差集比对，确认无遗漏。
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
@@ -28,7 +32,7 @@ jobs:
         # 实测 pytest-cov 不读 pytest.ini 的 [coverage:report] fail_under，
         # 写在那里会静默失效（门槛形同虚设，覆盖率再低也是绿标）。
         # 70 的依据：本机与 CI 环境（VECTOR_BACKEND=faiss + 假 key）实测均为
-        # 76.20%，留约 6 个百分点余量。
+        # 76.25%，留约 6 个百分点余量。
         run: pytest -m "not integration" --cov=app --cov-report=term-missing --cov-fail-under=70
         env:
           # config.validate() 在缺 DASHSCOPE_API_KEY 时直接抛 RuntimeError，

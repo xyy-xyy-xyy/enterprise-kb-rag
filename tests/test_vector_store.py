@@ -10,6 +10,7 @@
 """
 
 import os
+import sys
 
 import pytest
 from langchain_core.documents import Document
@@ -415,6 +416,26 @@ def test_qdrant_load_raises_a_ready_error_naming_the_collection(monkeypatch):
 
     assert "my_kb" in str(excinfo.value)
     assert "python -m app.ingestion" in str(excinfo.value)
+
+
+def test_missing_langchain_qdrant_reports_an_actionable_error(monkeypatch):
+    """缺依赖时必须报"照做就行"的错，而不是裸的 ModuleNotFoundError。
+
+    阶段五 CI 栽过一次：requirements.txt 漏声明 langchain-qdrant，本机（装了这个包）
+    全绿，全新环境里用例却报"索引未就绪"，根因被藏住。这条把提示文字钉死，
+    下次真缺依赖时一眼能看出该执行什么命令。
+
+    模拟手法：`sys.modules[name] = None` 会让 `from langchain_qdrant import ...`
+    抛 ImportError —— 等同于环境里没装这个包。
+    """
+    monkeypatch.setitem(sys.modules, "langchain_qdrant", None)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        vector_store._qdrant_vector_store_class()
+
+    message = str(excinfo.value)
+    assert "langchain-qdrant" in message
+    assert "pip install -r requirements.txt" in message
 
 
 # ============================ Qdrant：payload 解析 ============================
