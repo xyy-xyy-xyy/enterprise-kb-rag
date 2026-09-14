@@ -1,0 +1,48 @@
+# 一键起「企业知识库 RAG + Qdrant」两个容器。
+#
+#   SM4_KEY=$(cat data/.sm4_key) docker compose up --build
+#
+# SM4_KEY 为什么要这样显式传：见 app 服务 environment 里的注释，以及 README「Docker 部署」。
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    healthcheck:
+      # qdrant 镜像里没有 curl/wget，用 bash 内建的 /dev/tcp 探端口
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/6333"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    environment:
+      # compose 会自动加载同目录的 .env 做变量替换，所以这两项从 .env 读
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY:?未设置 DASHSCOPE_API_KEY：请先配置好 .env}
+      - VECTOR_BACKEND=qdrant
+      # 关键：容器内的 Qdrant 地址是**服务名**，不是 localhost。
+      # config.py 默认写的是 localhost，不覆盖就会连自己的容器都连不上（连接拒绝）。
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      # 关键：不传（或传空）时容器里没有密钥文件，crypto.load_or_create_key() 会
+      # **自动生成一把新密钥**，于是宿主机那些 .enc 在容器里全部解不开 ——
+      # 而且症状是"解密失败"而不是"密钥缺失"，极难排查。
+      # 这里用 ${SM4_KEY:?...} 而不是裸 ${SM4_KEY}：空值直接启动失败并打印原因，
+      # 而不是安静地起一个读不了任何文档的容器。
+      - SM4_KEY=${SM4_KEY:?未设置 SM4_KEY：容器会自动生成新密钥，宿主机 .enc 将全部解不开。请用 SM4_KEY=$(cat data/.sm4_key) docker compose up}
+      - ENCRYPT_STORE=true
+    volumes:
+      # 宿主机已有的密文文档直接给容器用；索引存在 Qdrant 服务里，不需要额外挂载
+      - ./data/docs:/app/data/docs
+
+volumes:
+  qdrant_storage:

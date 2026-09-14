@@ -12,6 +12,11 @@ data/_*
 *.egg-info/
 .pytest_cache/
 
+# 测试覆盖率产物（阶段五新增）
+.coverage
+.coverage.*
+htmlcov/
+
 # 国密安全层：密文、明文备份、SM4 密钥一律不进仓库
 data/docs/*.enc
 data/docs/*.bak

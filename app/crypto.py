@@ -468,9 +468,14 @@ def _cmd_verify_all() -> int:
             )
 
     if legacy_index:
-        print(f"\n巡检完成：{len(files)} 个文件，{ok_count} 个可正常解密，0 个异常。")
+        # ⚠️ 异常数不能硬编码成 0：解密失败的文件在循环里已经进了 problems，
+        # 写死 0 会让 --verify-all 在文件损坏时报告"全部正常"——而它存在的意义
+        # 恰恰是发现损坏。异常条目也要逐条打印，否则用户看不到是哪个文件坏了。
+        print(f"\n巡检完成：{len(files)} 个文件，{ok_count} 个可正常解密，{len(problems)} 个异常。")
+        for line in problems:
+            print(line)
         print("（老索引无 sm3_hash 记录，本次未做内容完整性比对）")
-        return 0
+        return 1 if problems else 0
 
     print(f"\n巡检完成：{len(files)} 个文件，{ok_count} 个与索引一致，{len(problems)} 个异常。")
     for line in problems:

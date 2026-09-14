@@ -1,0 +1,39 @@
+# 必须有这个文件，否则 venv/（几百 MB）、.git/、data/ 会被整个打进镜像。
+# 被 .gitignore 排除的文件不会自动被 docker 排除 —— 两者互不相干，各写一份。
+
+# 虚拟环境与 Python 产物
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 版本控制与 CI 配置
+.git/
+.gitignore
+.github/
+
+# 测试与覆盖率产物（运行镜像里不跑测试）
+tests/
+pytest.ini
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+
+# 机密：密钥、密钥文件、真实文档与索引，一律不进镜像
+.env
+data/
+*.enc
+*.bak
+*.key
+*.pem
+
+# 内部草稿与临时脚本
+.workbuddy/
+路线图进度.md
+ClaudeCode分工清单.md
+
+# 文档只留 README
+*.md
+!README.md

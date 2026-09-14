@@ -1,8 +1,10 @@
 # EnterpriseKB — 企业知识库智能问答系统
 
+[![CI](https://github.com/xyy-xyy-xyy/enterprise-kb-rag/actions/workflows/ci.yml/badge.svg)](https://github.com/xyy-xyy-xyy/enterprise-kb-rag/actions/workflows/ci.yml)
+
 基于 **RAG（检索增强生成）** 的企业知识库问答系统。上传 PDF / Word(.docx) 文档，系统自动完成解析、分块、向量化与索引构建；提问时检索相关片段，交由大模型生成**带引用来源与定位（PDF 页码 / Word 段落号）**的回答。
 
-> **当前状态**：阶段一（最小可用 RAG 链路）、阶段二（核心功能完善：混合检索 / Reranker / 流式输出 / 多轮对话）、阶段三（国密安全层：SM4 加密存储 / SM3 完整性校验 / 内容去重）已完成。
+> **当前状态**：阶段一（最小可用 RAG 链路）、阶段二（核心功能完善：混合检索 / Reranker / 流式输出 / 多轮对话）、阶段三（国密安全层：SM4 加密存储 / SM3 完整性校验 / 内容去重）、阶段四（RAG 质量评测体系）、阶段五（工程化：336 个离线单元测试 / GitHub Actions CI / Docker 一键部署）已完成。
 > 详细实施计划与进度见 [`路线图进度.md`](路线图进度.md)，安全设计边界见 [`SECURITY.md`](SECURITY.md)。
 
 ---
@@ -32,9 +34,13 @@
 | 失败回滚 | 上传采用临时文件中转，入库失败自动清理，不污染知识库 |
 | **RAG 质量评测** | 76 条人工 QA 数据集（带原文证据，`--validate` 自动校验 100% 命中）；四种检索方案横向对比，检索指标（Hit@1 / Hit@k / MRR）+ LLM-as-judge 三维打分（准确性 / 相关性 / 完整性），一键产出 `results.json` + `report.md` |
 
-### 🔄 规划中（对应路线图阶段五）
+### ✅ 工程化（阶段五）
 
-- **工程化收尾**：单元测试补全、CI、Docker 部署与演示材料
+| 能力 | 说明 |
+|---|---|
+| **自动化测试** | 336 个离线单元测试（`pytest -m "not integration"`），另有 10 个标记为 `integration` 的真实链路用例本地跑；CI 环境实测覆盖率 **76.20%** |
+| **持续集成** | GitHub Actions：每次 push / PR 自动装依赖、跑离线测试、校验覆盖率门槛（`--cov-fail-under=70`） |
+| **Docker 一键部署** | `Dockerfile` + `docker-compose.yml`（app + Qdrant 两个服务），`SM4_KEY` 未注入时**直接启动失败**并说明原因，避免容器读不了存量密文 |
 
 ---
 
@@ -234,6 +240,96 @@ Windows 用户也可以直接双击 `启动服务.bat`（会检查索引并启�
 
 ---
 
+## Docker 部署
+
+两个服务：`app`（本项目的 FastAPI + Gradio）与 `qdrant`（向量库）。
+
+```bash
+# SM4_KEY 必须显式传入，值就是仓库里那份密钥文件的内容
+SM4_KEY=$(cat data/.sm4_key) docker compose up --build
+```
+
+Windows PowerShell 下用：
+
+```powershell
+$env:SM4_KEY = Get-Content data\.sm4_key; docker compose up --build
+```
+
+起来后访问 <http://localhost:8000>（接口文档 `/docs`）。
+
+> **端口冲突提醒**：compose 会把 Qdrant 映射到宿主机的 6333。如果你本地已经有一个
+> Qdrant 容器占着这个端口，先 `docker stop` 它，或者只起应用服务：
+> `SM4_KEY=$(cat data/.sm4_key) docker compose up --build app`。
+
+### ⚠️ 不传 `SM4_KEY` 会怎样
+
+**这是本项目最容易踩、也最难排查的一个坑：**
+
+`data/.sm4_key` 在宿主机上，**不会**被挂进容器（compose 只挂了 `./data/docs`）。
+容器里没有密钥文件时，`crypto.load_or_create_key()` 会**自动生成一把新密钥** ——
+于是宿主机那些 `.enc` 在容器里**全部解不开**。而且症状是「解密失败」而不是「密钥缺失」，
+日志里只有一条 WARNING，非常容易误判成文件损坏。
+
+为此 compose 里写的是 `SM4_KEY=${SM4_KEY:?…}`：**没传就直接拒绝启动**并打印原因，
+而不是安静地起一个读不了任何文档的容器。你会看到：
+
+```
+error while interpolating services.app.environment.[]: required variable SM4_KEY is missing a value:
+未设置 SM4_KEY：容器会自动生成新密钥，宿主机 .enc 将全部解不开。请用 SM4_KEY=$(cat data/.sm4_key) docker compose up
+```
+
+同理 `QDRANT_HOST` 被覆盖成服务名 `qdrant`（`config.py` 里默认是 `localhost`），
+不覆盖的话容器会连自己的数据库都连不上。
+
+### 密钥怎么传
+
+| 方式 | 命令 | 说明 |
+|---|---|---|
+| 命令行传入 | `SM4_KEY=$(cat data/.sm4_key) docker compose up` | ✅ 推荐：密钥不落任何文件 |
+| 写进 `.env` | 在 `.env` 里加 `SM4_KEY=...` | 也可行（compose 会自动读同目录 `.env` 做变量替换），但 `.env` 一旦被误提交就泄漏了 |
+
+`DASHSCOPE_API_KEY` 与 `SM4_KEY` 都**不进镜像**：`.dockerignore` 排除了 `.env` 与 `data/`，
+镜像里只有 `app/` 与运行依赖。密钥一律运行时注入。
+
+### 容器里跑国密与入库命令
+
+```bash
+docker compose exec app python -m app.crypto --verify-all   # 完整性巡检
+docker compose exec app python -m app.ingestion             # 增量入库
+```
+
+---
+
+## 单元测试
+
+```bash
+# CI 用的离线用例：不连 Qdrant、不发任何 API 请求（集成用例被标记跳过）
+venv\Scripts\python.exe -m pytest -m "not integration" -q
+
+# 带覆盖率（CI 还会加 --cov-fail-under=70 卡门槛）
+venv\Scripts\python.exe -m pytest -m "not integration" --cov=app --cov-report=term-missing
+
+# 全量：含需要真实 API Key 与 Qdrant 的集成用例（本地有环境时才跑）
+venv\Scripts\python.exe -m pytest -q
+```
+
+| 文件 | 覆盖内容 |
+|---|---|
+| `tests/test_ingestion.py` | PDF/Word 解析、分块、标题识别、段落号、`chunk_id`、密文读取 |
+| `tests/test_retrieval.py` | RRF 融合顺序、BM25 召回、`_location_label`、Query 改写、prompt 拼装、流式生成 |
+| `tests/test_eval.py` | QA 数据集校验（能拦住编造的 evidence）、JSON 抠取、打分聚合、检索指标 |
+| `tests/test_eval_report.py` | 评测报告渲染与结论生成（阶段四交付物的生成逻辑） |
+| `tests/test_vector_store.py` | 双后端分发、索引存在性、Qdrant payload 解析与降级 |
+| `tests/test_crypto_cli.py` | `--encrypt-all` / `--decrypt-all` / `--verify-all` 等 CLI 子命令 |
+| `tests/test_main.py` | `/api/health`、`/api/ask`、SSE 流、`/api/ingest`、来源渲染 |
+| `tests/test_crypto.py` | SM3 / SM4 原语与加解密（阶段三既有 37 个用例） |
+| `tests/test_integration.py` | **全部标 `integration`，CI 不跑**：真实检索问答与真实入库 |
+
+> 集成用例需要真实 `DASHSCOPE_API_KEY` 与运行中的 Qdrant，因此不进 CI。
+> 它们会写入临时 collection（FAISS 后端则写临时目录），跑完自动清理，不碰你已有的索引。
+
+---
+
 ## RAG 质量评测
 
 用一套可复现的数据集，横向对比四种检索方案，回答一个问题：**混合检索 + Reranker 到底有没有比纯向量检索更好？**
@@ -422,13 +518,15 @@ enterprise-kb-rag/
 | 二 | 混合检索、Reranker、流式输出、多轮对话 | ✅ 完成 |
 | 三 | 国密安全层（SM4 加密 + SM3 校验 + 内容去重） | ✅ 完成 |
 | 四 | RAG 质量评测体系（Hit Rate / MRR / LLM-judge） | ✅ 完成 |
-| 五 | 单元测试、CI、Docker 部署、文档与演示材料 | ⬜ 待开始 |
+| 五 | 单元测试、CI、Docker 部署、文档与演示材料 | ✅ 完成 |
 
 ---
 
 ## 已知限制
 
 - 当前支持 PDF 与 Word(.docx)；尚未支持 Markdown、扫描件图片（图片内文字读不到）。
+- **CI 只跑离线单元测试**：`integration` 标记的用例需要真实 `DASHSCOPE_API_KEY` 与运行中的 Qdrant，只能在本地跑。CI 里的 `DASHSCOPE_API_KEY` 是一个假值，只为了让 `config.validate()` 不抛异常，**不会发出任何真实请求**（相关用例已全部标记跳过）。
+- 覆盖率基线为 CI 环境实测的 **76.20%**，其中 `app/vector_store.py` 的 Qdrant 分支、`app/eval/` 里需要调 LLM 的评测流程、`app/main.py` 的 Gradio 布局代码天然难以离线覆盖 —— 这些是真实缺口，没有用排除统计的方式修饰。
 - 不支持文档删除：删除 `data/docs/` 中的文件后，索引里的分块不会同步移除（需 `--rebuild` 重建）。
 - 同一份文档**改了内容但保持同名**时，仍会被 `source` 去重拦下（既有行为，未改成覆盖更新），需要先做文档删除才能重新入库 —— 这也是上一条的连带影响。
 
@@ -447,6 +545,19 @@ enterprise-kb-rag/
 - 会话过长时早期轮次会被截断，指代到很早之前的对象可能失效。
 - 流式输出为同步生成器实现，`/api/ask/stream` 每次请求占用一个线程（当前知识库规模下无压力）。
 - Qdrant 后端依赖 Docker 服务运行；服务未启动时报错而非静默降级。
+
+---
+
+## 演示截图
+
+> 截图由作者补充（本仓库暂未收录实际界面截图）。
+
+| 界面 | 说明 | 图片 |
+|---|---|---|
+| 知识问答 | 多轮对话 + 流式输出 + 引用来源定位 | ![知识问答界面](docs/screenshots/chat.png) |
+| 文档入库 | 上传 PDF / Word 并自动加密入库 | ![文档入库界面](docs/screenshots/ingest.png) |
+| 接口文档 | FastAPI 自动生成的 Swagger 页 | ![Swagger 接口文档](docs/screenshots/api-docs.png) |
+| 评测报告 | 四方案检索指标与结论（`data/eval/report.md`） | ![评测报告](docs/screenshots/eval-report.png) |
 
 ---
 

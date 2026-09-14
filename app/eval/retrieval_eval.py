@@ -39,7 +39,9 @@ def evaluate_retrieval(
             results = retrieval.search_with_strategy(question, k=k, strategy=strategy)
         except Exception as exc:
             # 单条检索失败不能中断整轮评测，记为未命中并在明细里留痕
-            logger.warning("[%s] 第 %d 条检索失败：%s", strategy, pair.get("id"), exc)
+            # 用 %s 而不是 %d：id 允许是字符串（如 "q001"），用 %d 会在 except 块
+            # 内部再抛 TypeError，反而让"单条失败不中断整轮"的承诺落空
+            logger.warning("[%s] 第 %s 条检索失败：%s", strategy, pair.get("id"), exc)
             results = []
 
         ranked_sources = [
