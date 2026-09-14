@@ -57,6 +57,11 @@ MAX_HISTORY_CHARS = int(os.getenv("MAX_HISTORY_CHARS", "500"))
 # 多轮检索查询改写：把“那交通费呢”改成独立可检索的查询
 MULTITURN_REWRITE = os.getenv("MULTITURN_REWRITE", "true").lower() == "true"
 
+# 评测：打分模型。刻意可与 LLM_MODEL 不同 —— 用生成答案的同一个模型给自己打分
+# 会有 self-enhancement bias（模型偏好自己的输出），换一个模型当裁判更客观。
+JUDGE_MODEL = os.getenv("JUDGE_MODEL", "qwen-max")
+EVAL_TOP_K = int(os.getenv("EVAL_TOP_K", "5"))
+
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 # 相对路径统一以项目根目录为基准，避免在 app/ 下运行时找不到文件

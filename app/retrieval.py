@@ -21,6 +21,14 @@ logger = logging.getLogger(__name__)
 # RRF（倒数排名融合）的平滑常数，取自原论文的通用取值
 RRF_K = 60
 
+# 可切换的检索策略。评测（app/eval）用它做四方案对比，
+# 线上则传 None 由 config 推导，两条路共用同一套实现。
+STRATEGY_VECTOR = "vector"
+STRATEGY_BM25 = "bm25"
+STRATEGY_HYBRID = "hybrid"
+STRATEGY_HYBRID_RERANK = "hybrid_rerank"
+STRATEGIES = (STRATEGY_VECTOR, STRATEGY_BM25, STRATEGY_HYBRID, STRATEGY_HYBRID_RERANK)
+
 # BM25 索引缓存：(文档指纹, BM25 实例, 文档列表)
 _bm25_cache: tuple[tuple, BM25Okapi | None, list[Document]] | None = None
 
@@ -200,18 +208,50 @@ def _rerank(query: str, results: list[tuple[Document, float]]) -> list[tuple[Doc
     return reranked
 
 
-def hybrid_search(query: str, k: int = None) -> list[tuple[Document, float]]:
-    """混合检索：向量召回 + BM25 召回 → RRF 融合 → Reranker 重排。
+def bm25_search(query: str, k: int = None) -> list[tuple[Document, float]]:
+    """纯 BM25 关键词检索，返回 [(Document, score)]，格式与 hybrid_search 一致。
 
-    返回格式与 vector_store.search 一致：[(Document, score)]，便于无缝替换。
-    HYBRID_RETRIEVAL=false 时退化为纯向量检索。
+    复用 _get_bm25_index() 与 _bm25_recall()（后者已过滤 0 分噪声）。
+    score 用名次折算：1.0 / (RRF_K + rank)，保证与 RRF 侧同量纲 ——
+    BM25 原始分数量纲与向量得分不可比，直接塞进去会让日志里的分数失去意义。
+
+    线上没有这条路径（config 推导不出 bm25），它的意义是评测里的**基线**：
+    没有它就无法说明"融合到底带来了多少增益"。
     """
     k = k or config.TOP_K
+    bm25, documents = _get_bm25_index()
+    if not bm25:
+        return []
+    hits = _bm25_recall(bm25, documents, query, k)
+    return [(doc, 1.0 / (RRF_K + rank)) for rank, doc in enumerate(hits, start=1)]
 
+
+def _resolve_strategy(strategy: str | None) -> str:
+    """把 strategy=None 按当前 config 推导成具体策略，保证线上行为不变。
+
+    HYBRID_RETRIEVAL=false                    -> "vector"
+    HYBRID_RETRIEVAL=true,  RERANK_ENABLED=false -> "hybrid"
+    HYBRID_RETRIEVAL=true,  RERANK_ENABLED=true  -> "hybrid_rerank"
+
+    非法 strategy 直接 ValueError：静默退回默认值会让评测跑出假数据，
+    而且不会报错 —— 这是最危险的一类失败。
+    """
+    if strategy is not None:
+        if strategy not in STRATEGIES:
+            raise ValueError(
+                f"未知的检索策略：{strategy!r}（可选：{' / '.join(STRATEGIES)}）"
+            )
+        return strategy
     if not config.HYBRID_RETRIEVAL:
-        logger.info("HYBRID_RETRIEVAL=false，使用纯向量检索。")
-        return vector_store.search(query, k=k)
+        return STRATEGY_VECTOR
+    return STRATEGY_HYBRID_RERANK if config.RERANK_ENABLED else STRATEGY_HYBRID
 
+
+def _hybrid_candidates(query: str, k: int) -> tuple[list[tuple[Document, float]], int, int, int]:
+    """混合检索的召回 + 融合阶段，返回 (候选, 向量条数, BM25 条数, 融合条数)。
+
+    hybrid 与 hybrid_rerank 只差最后一步是否重排，前四步完全一样，抽出来共用。
+    """
     candidate_k = max(k, config.TOP_K * config.HYBRID_CANDIDATE_MULTIPLIER)
 
     # 1) 向量召回
@@ -226,19 +266,59 @@ def hybrid_search(query: str, k: int = None) -> list[tuple[Document, float]]:
 
     # 3) RRF 融合
     fused = _rrf_fuse([vector_hits, bm25_hits])
-    if not fused:
+
+    # 4) 截断到重排窗口（重排只看这个窗口内的候选）
+    candidates = fused[: max(k, config.RERANK_TOP_N)]
+    return candidates, len(vector_hits), len(bm25_hits), len(fused)
+
+
+def search_with_strategy(
+    query: str, k: int = None, strategy: str = None
+) -> list[tuple[Document, float]]:
+    """按策略检索，返回 [(Document, score)]。
+
+    strategy ∈ {"vector", "bm25", "hybrid", "hybrid_rerank"}；
+    传 None 时按 config 推导，行为与改动前完全一致（见 _resolve_strategy）。
+    """
+    k = k or config.TOP_K
+    resolved = _resolve_strategy(strategy)
+
+    if resolved == STRATEGY_VECTOR:
+        if strategy is None:
+            logger.info("HYBRID_RETRIEVAL=false，使用纯向量检索。")
+        else:
+            logger.info("检索策略=vector %r：返回 %d 条。", query[:30], k)
+        return vector_store.search(query, k=k)
+
+    if resolved == STRATEGY_BM25:
+        results = bm25_search(query, k=k)
+        logger.info("检索策略=bm25 %r：返回 %d 条。", query[:30], len(results))
+        return results
+
+    candidates, n_vector, n_bm25, n_fused = _hybrid_candidates(query, k)
+    if not candidates:
         return []
 
-    # 4) Reranker 重排 top-N，再截断到 k
-    candidates = fused[: max(k, config.RERANK_TOP_N)]
-    if config.RERANK_ENABLED and len(candidates) > 1:
+    if resolved == STRATEGY_HYBRID_RERANK and len(candidates) > 1:
         candidates = _rerank(query, candidates)
 
     logger.info(
         "混合检索 %r：向量 %d 条 / BM25 %d 条 → 融合 %d 条 → 返回 %d 条。",
-        query[:30], len(vector_hits), len(bm25_hits), len(fused), min(k, len(candidates)),
+        query[:30], n_vector, n_bm25, n_fused, min(k, len(candidates)),
     )
     return candidates[:k]
+
+
+def hybrid_search(query: str, k: int = None) -> list[tuple[Document, float]]:
+    """混合检索：向量召回 + BM25 召回 → RRF 融合 → Reranker 重排。
+
+    返回格式与 vector_store.search 一致：[(Document, score)]，便于无缝替换。
+    HYBRID_RETRIEVAL=false 时退化为纯向量检索。
+
+    本函数是对 search_with_strategy 的薄封装（strategy=None → 按 config 推导），
+    保持对外签名与行为不变；评测传显式 strategy 走的是同一套代码。
+    """
+    return search_with_strategy(query, k=k)
 
 
 def _location_label(meta: dict) -> str:
@@ -404,12 +484,15 @@ def _condense_query(question: str, history: list[dict]) -> str:
 
 
 def _prepare_prompt(
-    question: str, k: int, history: list[dict] | None = None
+    question: str, k: int, history: list[dict] | None = None, strategy: str = None
 ) -> tuple[str, list[dict]]:
     """检索 → 拼装 prompt，返回 (prompt, sources)。
 
     无命中时返回 ("", [])：此时不发请求，直接用兜底文案。
     有历史时先改写查询再检索，但拼给 LLM 的仍是用户原话（改写只影响检索）。
+
+    strategy 透传给 search_with_strategy；为 None 时按 config 推导，
+    与改动前逐字节一致。评测用显式 strategy，答案生成链路与线上完全相同。
     """
     history = _sanitize_history(history or [])
     search_query = (
@@ -420,7 +503,7 @@ def _prepare_prompt(
     if search_query != question:
         logger.info("多轮检索改写：%r → %r", question, search_query)
 
-    results = hybrid_search(search_query, k=k)
+    results = search_with_strategy(search_query, k=k, strategy=strategy)
     if not results:
         logger.info("检索无结果，直接返回兜底回答。")
         return "", []
@@ -435,12 +518,15 @@ def _prepare_prompt(
 
 
 def answer_question(
-    question: str, k: int = None, history: list[dict] | None = None
+    question: str, k: int = None, history: list[dict] | None = None, strategy: str = None
 ) -> dict:
     """检索并生成回答，返回 {"answer": str, "sources": List[dict]}。
 
     history 为可选的多轮对话历史 [{"role","content"}]；
     不传时行为与单轮完全一致。
+    strategy 为可选的检索策略（{"vector","bm25","hybrid","hybrid_rerank"}）；
+    不传时按 config 推导，行为与改动前一致。评测用显式 strategy，
+    保证评的是真实线上链路（同一 prompt 模板、同一 LLM）。
     索引缺失时抛出 vector_store.IndexNotReadyError，由调用方决定如何提示。
     """
     config.setup_logging()
@@ -449,7 +535,7 @@ def answer_question(
     if not question or not question.strip():
         return {"answer": "请输入问题。", "sources": []}
 
-    prompt, sources = _prepare_prompt(question, k, history)
+    prompt, sources = _prepare_prompt(question, k, history, strategy)
     if not prompt:
         return {"answer": NO_RESULT_ANSWER, "sources": []}
 

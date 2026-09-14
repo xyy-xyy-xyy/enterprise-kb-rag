@@ -30,10 +30,10 @@
 | **多轮对话** | 支持「那交通费怎么算？」「它适用于哪些人？」等指代式追问；检索前用 LLM 把追问改写成独立查询（Query Rewrite），改写只影响检索、不影响回答 |
 | 双入口 | FastAPI REST 接口 + Gradio 可视化界面（同一进程挂载） |
 | 失败回滚 | 上传采用临时文件中转，入库失败自动清理，不污染知识库 |
+| **RAG 质量评测** | 76 条人工 QA 数据集（带原文证据，`--validate` 自动校验 100% 命中）；四种检索方案横向对比，检索指标（Hit@1 / Hit@k / MRR）+ LLM-as-judge 三维打分（准确性 / 相关性 / 完整性），一键产出 `results.json` + `report.md` |
 
-### 🔄 规划中（对应路线图阶段四 ~ 五）
+### 🔄 规划中（对应路线图阶段五）
 
-- **RAG 质量评测体系**：Hit Rate / MRR / LLM-as-judge 对比实验
 - **工程化收尾**：单元测试补全、CI、Docker 部署与演示材料
 
 ---
@@ -135,6 +135,11 @@ MAX_HISTORY_TURNS=5
 MAX_HISTORY_CHARS=500
 MULTITURN_REWRITE=true
 
+# 质量评测
+# 裁判模型刻意与 LLM_MODEL 不同：用生成答案的同一个模型给自己打分有 self-enhancement bias
+JUDGE_MODEL=qwen-max
+EVAL_TOP_K=5
+
 # 国密安全层
 ENCRYPT_STORE=true
 SM3_DEDUP=true
@@ -229,6 +234,75 @@ Windows 用户也可以直接双击 `启动服务.bat`（会检查索引并启�
 
 ---
 
+## RAG 质量评测
+
+用一套可复现的数据集，横向对比四种检索方案，回答一个问题：**混合检索 + Reranker 到底有没有比纯向量检索更好？**
+
+### 数据集
+
+`data/eval/qa_pairs.json` —— 76 条 QA，覆盖知识库全部 9 份文档，分三种题型：
+
+| 题型 | 条数 | 说明 |
+|---|---|---|
+| 事实型 | 44 | 单一事实点，如「一线城市住宿费上限是多少」 |
+| 推理型 | 19 | 需要跨句/跨段组合，如「出差 40 天后才报销会怎样」 |
+| 对比型 | 13 | 需要跨文档辨析冲突条款，如三份差旅制度的不同标准 |
+
+每条都带 `evidence`（原文逐字摘录）。`--validate` 会把每条证据在被引文档的分块正文里重新搜一遍，**证据对不上就直接失败** —— 防止凭印象编题。
+
+```bash
+# 只校验数据集（不调 API，秒级）
+venv\Scripts\python.exe -m app.eval.run_eval --validate
+
+# 先小样本打通链路，再全量
+venv\Scripts\python.exe -m app.eval.run_eval --limit 5 --no-judge
+venv\Scripts\python.exe -m app.eval.run_eval --limit 5
+
+# 全量评测（76 条 × 4 方案，约 35 分钟，会产生 API 费用）
+venv\Scripts\python.exe -m app.eval.run_eval
+
+# 只重跑裁判打分（改了 JUDGE_TEMPLATE 之后用；复用已有答案，不重新检索/生成，开销减半）
+venv\Scripts\python.exe -m app.eval.run_eval --rejudge
+```
+
+### 四种方案
+
+全部走 `retrieval.search_with_strategy(query, k, strategy=...)`，**运行时切换，不修改任何全局配置**
+（改 `config.HYBRID_RETRIEVAL` 这类模块级开关会静默污染后续调用）：
+
+| 策略值 | 含义 |
+|---|---|
+| `vector` | 纯向量检索（基线） |
+| `bm25` | 纯 BM25 关键词检索 |
+| `hybrid` | 向量 + BM25 → RRF 融合 |
+| `hybrid_rerank` | 上一步 + `qwen3-rerank` 重排（= 生产默认） |
+
+`hybrid_search()` 保留为 `search_with_strategy()` 的薄封装，**对外行为不变**。
+
+### 实测结果（2026-09-14，76 条 QA，top-k=5）
+
+| 方案 | Hit@1 | Hit@5 | MRR | 准确性 | 相关性 | 完整性 |
+|---|---|---|---|---|---|---|
+| 纯向量检索 | 93.4% | 100.0% | 0.965 | 4.68 | 4.74 | 3.75 |
+| 纯 BM25 | 84.2% | 100.0% | 0.913 | 4.78 | 4.80 | 3.84 |
+| 混合检索（RRF） | **94.7%** | 100.0% | **0.971** | **4.89** | 4.87 | 4.05 |
+| 混合 + Reranker | 85.5% | 100.0% | 0.923 | 4.83 | **5.00** | **4.07** |
+
+结论（完整分析见 [`data/eval/report.md`](data/eval/report.md)）：
+
+- **混合检索（RRF）检索指标最好**：Hit@1 +1.3pp、MRR +0.7pp；单纯 BM25 比向量检索差 9.2pp。
+- **Reranker 提升了答案质量，却让「首位命中」变差**：Hit@1 比纯 RRF 低 9.2pp，但相关性、完整性是四者最高。
+  逐条核对发现：8 道题在纯 RRF 下正确文档排第 1，重排后被**同主题的另一份文档**挤下去（平均掉到第 2.1 位）。
+  原因是重排模型按语义相关性打分，在内容高度相似、只有条款数字不同的文档上（两份差旅制度都写「一线城市住宿费上限」）
+  区分度不足；而 RRF 融合保留了 BM25 对文档名与专有名词的字面精确匹配能力。
+  答案准确性没跟着掉，是因为正确文档仍在 top-5 内、LLM 能从中挑对 —— 但「首位就是对的」确实变差了，生产配置里要权衡。
+- **Hit@5 四个方案全是 100%**，在 9 份文档的语料上该指标已触顶、没有区分度，实际差异要看 Hit@1 与 MRR。
+- 完整性分呈正态分布（5 分 57%、3 分 17%、0 分 6%），扣分理由可查（如「未提及二线城市上限」），是可信评分而非模板偏差。
+
+指标口径与已知偏差（单次采样、文档级命中、裁判偏好、语料规模）全部写在 `report.md` 的「局限性」一节。
+
+---
+
 ## API 接口
 
 | 方法 | 路径 | 说明 |
@@ -307,12 +381,18 @@ enterprise-kb-rag/
 │   ├── crypto.py          # 国密安全层：SM4 加解密 / SM3 摘要 / 密钥管理 + CLI
 │   ├── vector_store.py    # 向量索引（FAISS + Qdrant 双后端抽象层）
 │   ├── ingestion.py       # 文档(PDF/Word) → 分块 → 向量化 → 入库（含去重、加密与回滚）
-│   ├── retrieval.py       # 检索（混合+重排）→ 多轮查询改写 → 拼装 Prompt → 调用 LLM
+│   ├── retrieval.py       # 检索（可切换策略）→ 多轮查询改写 → 拼装 Prompt → 调用 LLM
+│   ├── eval/              # RAG 质量评测：数据集校验 / 检索指标 / LLM 打分 / 报告生成
+│   │   ├── dataset.py     #    加载 + 校验 QA 数据集（evidence 必须能在原文里找到）
+│   │   ├── retrieval_eval.py  # Hit@1 / Hit@k / MRR（未命中记 0 且保留在分母）
+│   │   ├── answer_eval.py #    LLM-as-judge：准确性 / 相关性 / 完整性三维打分
+│   │   └── run_eval.py    #    CLI 入口：跑四方案 → results.json + report.md
 │   └── main.py            # FastAPI 路由 + Gradio 界面挂载
 ├── tests/
 │   └── test_crypto.py     # 国密层单元测试（SM3 向量 / SM4 往返 / IV 随机性 / 密钥解析）
 ├── data/
-│   └── docs/              # 知识库文档（.enc 密文，自行放入，不纳入 Git）
+│   ├── docs/              # 知识库文档（.enc 密文，自行放入，不纳入 Git）
+│   └── eval/              # QA 数据集 + 评测产物（纳入 Git，便于复现对比）
 ├── SECURITY.md            # 安全设计说明：威胁模型、加密范围、密钥管理、已知限制
 ├── 启动服务.bat            # Windows 一键启动脚本
 ├── 路线图进度.md           # 分阶段实施进度与执行说明
@@ -341,7 +421,7 @@ enterprise-kb-rag/
 | 一 | 环境搭建与最小 RAG 链路（双后端可用） | ✅ 完成 |
 | 二 | 混合检索、Reranker、流式输出、多轮对话 | ✅ 完成 |
 | 三 | 国密安全层（SM4 加密 + SM3 校验 + 内容去重） | ✅ 完成 |
-| 四 | RAG 质量评测体系（Hit Rate / MRR / LLM-judge） | ⬜ 待开始 |
+| 四 | RAG 质量评测体系（Hit Rate / MRR / LLM-judge） | ✅ 完成 |
 | 五 | 单元测试、CI、Docker 部署、文档与演示材料 | ⬜ 待开始 |
 
 ---
