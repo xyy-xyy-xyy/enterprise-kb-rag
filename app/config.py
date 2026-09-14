@@ -40,6 +40,16 @@ RERANK_TOP_N = int(os.getenv("RERANK_TOP_N", "10"))
 # 注意：gte-rerank 已于 2026-05-30 下线，官方迁移目标为 qwen3-rerank
 RERANK_MODEL = os.getenv("RERANK_MODEL", "qwen3-rerank")
 
+# 国密安全层
+# 文档是否加密落盘（.enc）；false 时行为与改动前完全一致，用于对照演示与排查
+ENCRYPT_STORE = os.getenv("ENCRYPT_STORE", "true").lower() == "true"
+# 是否按 SM3 内容摘要去重（相同内容换文件名上传也能识别）
+SM3_DEDUP = os.getenv("SM3_DEDUP", "true").lower() == "true"
+# SM4 密钥（32 位 hex = 16 字节），优先级高于密钥文件
+SM4_KEY = os.getenv("SM4_KEY")
+# 密钥文件路径（十六进制文本），相对项目根目录解析
+SM4_KEY_FILE = os.getenv("SM4_KEY_FILE", "data/.sm4_key")
+
 # 多轮对话：最多携带的历史轮数（1 轮 = 1 条用户 + 1 条助手）
 MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "5"))
 # 单条历史消息的最大字符数，超出截断，避免 prompt 膨胀
@@ -59,6 +69,7 @@ def resolve_path(path: str) -> str:
 
 INDEX_DIR = resolve_path(FAISS_INDEX_PATH)
 DOCS_PATH = resolve_path(DOCS_DIR)
+SM4_KEY_PATH = resolve_path(SM4_KEY_FILE)
 
 
 def setup_logging() -> None:

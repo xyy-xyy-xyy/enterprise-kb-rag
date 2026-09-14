@@ -1,13 +1,17 @@
 """文档入库：加载 → 分块 → 向量化 → 存向量索引（FAISS 或 Qdrant）。
 
 支持 PDF 与 Word(.docx) 两种格式，解析后统一成同一套 metadata 结构
-（source / file_name / page / chunk_id / paragraph_start / paragraph_end），
+（source / file_name / page / chunk_id / paragraph_start / paragraph_end / sm3_hash），
 便于后续混合检索与回答里的精确定位（PDF 用页码，Word 用段落号）。
 
 分块时做中文标题增强：识别章节标题后拼到其下每个 chunk 的正文前，
 形如 "[标题] 第三章 报销流程\n正文…"，提升关键词与向量召回的可定位性。
+
+文档可以密文（`.enc`）落盘：解析前在内存里解密，全程不落临时文件。
+`file_name` / `source` 一律用剥掉 `.enc` 的逻辑名，否则明文版与密文版会被判成两个文档。
 """
 
+import io
 import logging
 import os
 import re
@@ -17,7 +21,7 @@ import pymupdf
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from app import config, vector_store
+from app import config, crypto, vector_store
 
 logger = logging.getLogger(__name__)
 
@@ -171,20 +175,26 @@ def _section_to_chunks(
     ]
 
 
-def _finalize_chunks(chunks: list[Document], file_path: str) -> list[Document]:
-    """统一补 metadata：source / file_name / page / chunk_id / 段落定位。
+def _finalize_chunks(
+    chunks: list[Document], file_path: str, sm3_hash: str | None = None
+) -> list[Document]:
+    """统一补 metadata：source / file_name / page / chunk_id / 段落定位 / sm3_hash。
 
     chunk_id 形如 "{file_name}_p{page}_{i}"，i 为文档内块序号，
     供混合检索的 RRF 融合作为唯一 key（同一页的多个分块必须能区分开）。
+    sm3_hash 只进 metadata，**不要拼进 chunk_id**：chunk_id 格式一变，
+    RRF 融合的 key 全部错位。
+
+    注意本函数是整块重写 metadata，任何新字段都必须在这里补，否则会被静默抹掉。
 
     paragraph_start / paragraph_end 由 _split_pdf / _split_docx 写入；
     旧索引重建前可能缺失（None），不要抛异常，缺失即不写。
     """
-    file_name = os.path.basename(file_path)
-    source = normalize_source(file_path)
+    file_name = crypto.logical_name(file_path)
+    source = crypto.logical_source(file_path)
     for i, chunk in enumerate(chunks):
         page = chunk.metadata.get("page", 0)
-        chunk.metadata = {
+        metadata = {
             "source": source,
             "file_name": file_name,
             "page": page,
@@ -192,7 +202,25 @@ def _finalize_chunks(chunks: list[Document], file_path: str) -> list[Document]:
             "paragraph_start": chunk.metadata.get("paragraph_start"),
             "paragraph_end": chunk.metadata.get("paragraph_end"),
         }
+        # sm3_hash 为 None 时不写，保持与旧索引一致的结构
+        if sm3_hash:
+            metadata["sm3_hash"] = sm3_hash
+        chunk.metadata = metadata
     return chunks
+
+
+def read_document_bytes(file_path: str) -> tuple[bytes, str, str]:
+    """读取文档明文，返回 (明文字节, 逻辑文件名, 逻辑 source)。
+
+    `.enc` 走内存解密，明文直接读；调用方不需要关心磁盘上是哪种形态。
+    """
+    if crypto.is_encrypted(file_path):
+        key = crypto.load_or_create_key()
+        data = crypto.decrypt_file_to_bytes(file_path, key)
+    else:
+        with open(file_path, "rb") as f:
+            data = f.read()
+    return data, crypto.logical_name(file_path), crypto.logical_source(file_path)
 
 
 def _docx_paragraph_is_bold(paragraph) -> bool:
@@ -236,11 +264,21 @@ def _docx_blocks(document) -> list[tuple[str, bool, int]]:
 
 def _split_pdf(file_path: str) -> list[Document]:
     """加载 PDF 并切分为带 metadata 的分块（页码 1-based，含标题增强）。"""
+    data, _, _ = read_document_bytes(file_path)
+    return _split_pdf_bytes(data, file_path)
+
+
+def _split_pdf_bytes(data: bytes, file_path: str) -> list[Document]:
+    """从内存字节解析 PDF。
+
+    `file_path` 只用于生成 metadata（逻辑名 / source），不再用于打开文件 ——
+    密文文档在内存里解密后直接喂给解析器，明文全程不落盘。
+    """
     logger.info("正在解析 PDF：%s", file_path)
     splitter = _build_splitter()
     chunks: list[Document] = []
 
-    with pymupdf.open(file_path) as pdf:
+    with pymupdf.open(stream=data, filetype="pdf") as pdf:
         page_count = pdf.page_count
         for page_number, page in enumerate(pdf, start=1):
             for heading, text, p_start, p_end in _group_sections(_pdf_page_blocks(page)):
@@ -262,22 +300,30 @@ def _split_pdf(file_path: str) -> list[Document]:
         logger.warning("PDF 无可用文本内容：%s", file_path)
         return []
 
-    _finalize_chunks(chunks, file_path)
+    _finalize_chunks(chunks, file_path, sm3_hash=crypto.sm3_hex(data))
     logger.info(
-        "%s → %d 页 → %d 个分块", os.path.basename(file_path), page_count, len(chunks)
+        "%s → %d 页 → %d 个分块", crypto.logical_name(file_path), page_count, len(chunks)
     )
     return chunks
 
 
 def _split_docx(file_path: str) -> list[Document]:
-    """加载 Word(.docx) 并切分为带 metadata 的分块（含标题增强）。
+    """加载 Word(.docx) 并切分为带 metadata 的分块（含标题增强）。"""
+    data, _, _ = read_document_bytes(file_path)
+    return _split_docx_bytes(data, file_path)
+
+
+def _split_docx_bytes(data: bytes, file_path: str) -> list[Document]:
+    """从内存字节解析 Word(.docx)。
 
     python-docx 只能读取段落与表格中的文本；文档里的图片、文本框、SmartArt
     读不到，这属于正常情况，不视为错误。docx 没有页码概念，page 统一填 0，
     保持与 PDF 一致的 metadata 结构以便混合检索。
+
+    同 `_split_pdf_bytes`，`file_path` 只用于生成 metadata。
     """
     logger.info("正在解析 Word：%s", file_path)
-    document = docx.Document(file_path)
+    document = docx.Document(io.BytesIO(data))
     splitter = _build_splitter()
     chunks: list[Document] = []
 
@@ -300,42 +346,72 @@ def _split_docx(file_path: str) -> list[Document]:
         logger.warning("Word 无可用文本内容：%s", file_path)
         return []
 
-    _finalize_chunks(chunks, file_path)
-    logger.info("%s → %d 个分块", os.path.basename(file_path), len(chunks))
+    _finalize_chunks(chunks, file_path, sm3_hash=crypto.sm3_hex(data))
+    logger.info("%s → %d 个分块", crypto.logical_name(file_path), len(chunks))
     return chunks
 
 
-def ingest_file(file_path: str) -> int:
-    """对单个文档（.pdf / .docx）执行完整入库流程，返回写入的分块数。
+def _resolve_stored_path(file_path: str) -> str:
+    """把逻辑路径解析成磁盘上的实际路径。
 
-    索引已存在时追加而非覆盖；若该文件已入库则跳过（返回 0）。
+    加密存储下磁盘上是 `xxx.pdf.enc`，而调用方（API / UI / 遍历）手里通常是
+    `xxx.pdf`。这里自动定位，调用方就不必关心存储形态。
+    """
+    if os.path.exists(file_path):
+        return file_path
+    encrypted = file_path + crypto.ENC_SUFFIX
+    if os.path.exists(encrypted):
+        return encrypted
+    return file_path  # 都不存在：交给后面的 FileNotFoundError 报清楚
+
+
+def ingest_file(file_path: str) -> int:
+    """对单个文档（.pdf / .docx，或其 `.enc` 密文）执行完整入库流程，返回写入的分块数。
+
+    索引已存在时追加而非覆盖。两种跳过要分清楚：
+      - `已入库，跳过`：source（归一化路径）命中，同一路径重复入库
+      - `内容重复已存在(<文件名>)，跳过`：SM3 命中，换个文件名传同一份内容也会被拦下
     需要重新解析同一文件请用 `ingest_directory(rebuild=True)` 重建索引。
     """
     config.setup_logging()
 
-    if not os.path.exists(file_path):
+    stored_path = _resolve_stored_path(file_path)
+    if not os.path.exists(stored_path):
         raise FileNotFoundError(f"文件不存在：{file_path}")
 
-    ext = os.path.splitext(file_path)[1].lower()
+    # 扩展名按逻辑名判断：密文路径的 splitext 结果是 ".enc"
+    logical = crypto.logical_name(stored_path)
+    ext = os.path.splitext(logical)[1].lower()
     if ext == ".pdf":
-        split_func = _split_pdf
+        split_func = _split_pdf_bytes
     elif ext == ".docx":
-        split_func = _split_docx
+        split_func = _split_docx_bytes
     else:
         raise ValueError(
             f"不支持的文件类型：{ext or file_path}（仅支持 {' / '.join(SUPPORTED_EXTENSIONS)}）"
         )
 
+    data, file_name, source = read_document_bytes(stored_path)
+    sm3_hash = crypto.sm3_hex(data)
+
     if vector_store.index_exists():
         store = vector_store.load_index()
-        if normalize_source(file_path) in vector_store.get_indexed_sources(store):
-            logger.info("已入库，跳过：%s", file_path)
+        if config.SM3_DEDUP:
+            # 命中即说明内容已存在（哪怕换了文件名）；store 只对 FAISS 生效
+            duplicate = vector_store.get_indexed_hashes(store).get(sm3_hash)
+            if duplicate:
+                logger.info(
+                    "内容重复已存在(%s)，跳过：%s", duplicate, file_name
+                )
+                return 0
+        if source in vector_store.get_indexed_sources(store):
+            logger.info("已入库，跳过：%s", file_name)
             return 0
     else:
         logger.info("未检测到已有索引，将新建。")
         store = None
 
-    chunks = split_func(file_path)
+    chunks = split_func(data, stored_path)
     if not chunks:
         return 0
 
@@ -345,7 +421,7 @@ def ingest_file(file_path: str) -> int:
         store = vector_store.add_documents(store, chunks)
 
     vector_store.save_index(store)
-    logger.info("入库完成：%s（%d 个分块）", os.path.basename(file_path), len(chunks))
+    logger.info("入库完成：%s（%d 个分块）", file_name, len(chunks))
     return len(chunks)
 
 
@@ -357,6 +433,35 @@ def ingest_pdf(file_path: str) -> int:
 def reset_index() -> None:
     """删除索引（用于重建）。FAISS 删文件，Qdrant 删 collection。"""
     vector_store.reset_index()
+
+
+def _scan_document_files(dir_path: str) -> list[str]:
+    """扫描目录下的文档：明文与密文都收，同名时优先密文。
+
+    返回按逻辑名排序的实际路径列表（密文路径带 `.enc`）。
+    """
+    names = sorted(os.listdir(dir_path))
+    encrypted = {
+        name[: -len(crypto.ENC_SUFFIX)]: name
+        for name in names
+        if name.lower().endswith(crypto.ENC_SUFFIX)
+        and name[: -len(crypto.ENC_SUFFIX)].lower().endswith(SUPPORTED_EXTENSIONS)
+    }
+    chosen = dict(encrypted)
+    for name in names:
+        if not name.lower().endswith(SUPPORTED_EXTENSIONS):
+            continue
+        if name in chosen:
+            logger.warning(
+                "明文与密文同时存在，本次使用密文：%s%s（明文 %s 已被忽略）",
+                name,
+                crypto.ENC_SUFFIX,
+                name,
+            )
+            continue
+        chosen[name] = name
+
+    return [os.path.join(dir_path, name) for name in sorted(chosen.values())]
 
 
 def ingest_directory(dir_path: str = None, rebuild: bool = False) -> dict:
@@ -372,11 +477,7 @@ def ingest_directory(dir_path: str = None, rebuild: bool = False) -> dict:
         logger.info("rebuild=True，将清空索引并全量重建。")
         reset_index()
 
-    doc_files = sorted(
-        os.path.join(dir_path, name)
-        for name in os.listdir(dir_path)
-        if name.lower().endswith(SUPPORTED_EXTENSIONS)
-    )
+    doc_files = _scan_document_files(dir_path)
     if not doc_files:
         logger.warning("目录 %s 下没有找到文档（.pdf/.docx），请放入文档后重试。", dir_path)
         return {"files": 0, "chunks": 0, "skipped": 0}
@@ -413,7 +514,19 @@ if __name__ == "__main__":
         action="store_true",
         help="清空已有索引并全量重建（默认只追加新文档）",
     )
+    # 国密相关的维护命令转发给 app.crypto，统一在那边实现
+    parser.add_argument(
+        "--encrypt-all", action="store_true", help="data/docs/ 明文 → .enc（转发给 app.crypto）"
+    )
+    parser.add_argument(
+        "--verify-all", action="store_true", help="解密重算 SM3 并与索引比对（转发给 app.crypto）"
+    )
     args = parser.parse_args()
+
+    if args.encrypt_all:
+        raise SystemExit(crypto.main(["--encrypt-all"]))
+    if args.verify_all:
+        raise SystemExit(crypto.main(["--verify-all"]))
 
     # 扫描 data/docs/ 下所有文档，建索引
     stats = ingest_directory(args.docs, rebuild=args.rebuild)

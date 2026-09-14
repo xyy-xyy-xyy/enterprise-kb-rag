@@ -11,7 +11,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from app import config, ingestion, retrieval, vector_store
+from app import config, crypto, ingestion, retrieval, vector_store
 
 config.setup_logging()
 logger = logging.getLogger(__name__)
@@ -27,6 +27,32 @@ class AskRequest(BaseModel):
     history: list[dict] | None = None
 
 
+# --------------------------- 上传落盘辅助 ---------------------------
+
+
+def _encrypt_in_place(target: str) -> str:
+    """按配置把刚落盘的明文加密成 `.enc` 并删除明文，返回实际落盘路径。
+
+    `ENCRYPT_STORE=false` 时原样返回，行为与改动前一致。
+    加密成功后才删明文：中途失败至少还留着明文，不会两头空。
+    """
+    if not config.ENCRYPT_STORE:
+        return target
+    encrypted = crypto.encrypt_file(target, crypto.load_or_create_key())
+    os.remove(target)
+    return encrypted
+
+
+def _remove_artifacts(*paths: str) -> None:
+    """回滚：删掉本次可能产生的文件，保证不留下半成品。"""
+    for path in paths:
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                logger.warning("回滚时无法删除：%s", path)
+
+
 # --------------------------- FastAPI 路由 ---------------------------
 
 
@@ -38,6 +64,8 @@ def health() -> dict:
         "llm_model": config.LLM_MODEL,
         "embedding_model": config.EMBEDDING_MODEL,
         "vector_backend": config.VECTOR_BACKEND,
+        "encrypt_store": config.ENCRYPT_STORE,
+        "sm3_dedup": config.SM3_DEDUP,
         "index_ready": vector_store.index_exists(),
         "index_path": config.INDEX_DIR if config.VECTOR_BACKEND == "faiss" else f"qdrant:{config.QDRANT_COLLECTION}",
     }
@@ -55,7 +83,8 @@ async def api_ingest(file: UploadFile = File(...)) -> dict:
 
     os.makedirs(config.DOCS_PATH, exist_ok=True)
     target = os.path.join(config.DOCS_PATH, os.path.basename(file.filename))
-    existed_before = os.path.exists(target)
+    # 加密存储时磁盘上是 .enc，两种形态都要看，才能正确判断"是不是新文件"
+    existed_before = os.path.exists(target) or os.path.exists(target + crypto.ENC_SUFFIX)
 
     # 先写临时文件，完整接收后再落位，避免半个文件污染知识库目录
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=ext)
@@ -66,19 +95,17 @@ async def api_ingest(file: UploadFile = File(...)) -> dict:
         # 必须先落位再入库：索引里的 source 记录的是最终路径，
         # 否则临时路径会写进索引，既导致重复上传无法去重，也留下失效引用
         shutil.move(tmp_path, target)
-        try:
-            chunks = ingestion.ingest_file(target)
-        except Exception:
-            # 入库失败则回滚，不留下未入库的文件
-            if not existed_before and os.path.exists(target):
-                os.remove(target)
-            raise
+        stored_path = _encrypt_in_place(target)
+        chunks = ingestion.ingest_file(stored_path)
     except Exception as exc:
         logger.exception("上传入库失败：%s", file.filename)
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        # 回滚：临时文件、明文、密文三者都不留半成品
+        _remove_artifacts(tmp_path)
+        if not existed_before:
+            _remove_artifacts(target, target + crypto.ENC_SUFFIX)
         raise HTTPException(status_code=500, detail=f"入库失败：{exc}") from exc
 
+    # 对外返回逻辑路径（不带 .enc），与索引里的 source 一致
     return {"status": "success", "chunks": chunks, "file": target}
 
 
@@ -248,18 +275,24 @@ def ui_ingest(files):
     for path in files:
         name = os.path.basename(path)
         target = os.path.join(config.DOCS_PATH, name)
+        existed_before = os.path.exists(target) or os.path.exists(
+            target + crypto.ENC_SUFFIX
+        )
         try:
             # 同 API：先落到知识库目录，再入库，保证索引里的 source 是最终路径
             if os.path.abspath(path) != os.path.abspath(target):
                 shutil.copy2(path, target)
-            chunks = ingestion.ingest_file(target)
+            stored_path = _encrypt_in_place(target)
+            chunks = ingestion.ingest_file(stored_path)
             total += chunks
             if chunks:
                 messages.append(f"- ✅ {name}：新增 {chunks} 个分块")
             else:
-                messages.append(f"- ⏭️ {name}：已入库，跳过")
+                messages.append(f"- ⏭️ {name}：已入库或内容重复，跳过")
         except Exception as exc:
             logger.exception("入库失败：%s", name)
+            if not existed_before:
+                _remove_artifacts(target, target + crypto.ENC_SUFFIX)
             messages.append(f"- ❌ {name}：{exc}")
     return f"**入库完成**（共新增 {total} 个分块）\n" + "\n".join(messages)
 

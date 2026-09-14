@@ -133,6 +133,34 @@ def get_all_documents() -> list[Document]:
     return _faiss_get_all_documents()
 
 
+def get_indexed_hashes(vectorstore=None) -> dict[str, str]:
+    """读取索引中的 {sm3_hash: file_name}，用于按内容去重。
+
+    注意 `vectorstore` 只对 FAISS 后端生效：FAISS 的分块都在已加载的 docstore 里，
+    传进来可直接复用。Qdrant 的分块存在服务端，无论传什么都得再 scroll 一次
+    才能拿到 payload，因此该参数在 Qdrant 下会被忽略（属预期，非遗漏）。
+
+    旧索引里的分块没有 sm3_hash 字段，遇到必须跳过而不是 KeyError。
+    """
+    if config.VECTOR_BACKEND == "qdrant":
+        return _qdrant_get_hashes()
+    return _faiss_get_hashes(vectorstore)
+
+
+def _collect_hashes(metadatas) -> dict[str, str]:
+    """把 metadata 列表收成 {sm3_hash: file_name}，缺字段的条目直接跳过。
+
+    同一个摘要可能对应多个分块（同一文档的所有分块共享一个 SM3），
+    setdefault 保留最先遇到的文件名即可。
+    """
+    hashes: dict[str, str] = {}
+    for meta in metadatas:
+        digest = meta.get("sm3_hash")
+        if digest:
+            hashes.setdefault(digest, meta.get("file_name"))
+    return hashes
+
+
 def reset_index() -> None:
     """删除索引（用于重建）。"""
     if config.VECTOR_BACKEND == "qdrant":
@@ -182,6 +210,18 @@ def _faiss_get_all_documents() -> list[Document]:
         # 不同 langchain 版本内部结构可能变化，降级为“BM25 无候选”而非报错
         logger.warning("无法读取 FAISS 索引中的文档，BM25 召回将跳过。")
         return []
+
+
+def _faiss_get_hashes(vectorstore=None) -> dict[str, str]:
+    """从 FAISS docstore 里收集内容摘要。"""
+    try:
+        docs = (vectorstore or load_index()).docstore._dict.values()
+    except AttributeError:
+        logger.debug("无法读取 FAISS 索引中的文档摘要，跳过去重检查。")
+        return {}
+    return _collect_hashes(
+        (doc.metadata or {}) for doc in docs
+    )
 
 
 # ============================ Qdrant 后端 ============================
@@ -267,6 +307,28 @@ def _qdrant_get_sources(vectorstore) -> set[str]:
     except Exception as exc:
         logger.debug("读取 Qdrant 文档来源失败：%s", exc)
         return set()
+
+
+def _qdrant_get_hashes() -> dict[str, str]:
+    """从 Qdrant payload 里收集内容摘要（只取需要的两个字段）。"""
+    try:
+        client = _get_qdrant_client()
+        # 必须显式取 payload，否则 point.payload 为 None，去重会永远失效；
+        # 只取 metadata 里的两个字段，避免把全部正文都拉回来
+        points, _ = client.scroll(
+            collection_name=config.QDRANT_COLLECTION,
+            limit=10000,
+            with_payload=["metadata.sm3_hash", "metadata.file_name"],
+            with_vectors=False,
+        )
+    except Exception as exc:
+        logger.debug("读取 Qdrant 内容摘要失败：%s", exc)
+        return {}
+
+    return _collect_hashes(
+        # LangChain 写入的 payload 为 {page_content, metadata}
+        ((point.payload or {}).get("metadata") or {}) for point in points
+    )
 
 
 def _qdrant_get_all_documents() -> list[Document]:
