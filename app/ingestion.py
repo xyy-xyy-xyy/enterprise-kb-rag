@@ -1,7 +1,8 @@
 """文档入库：加载 → 分块 → 向量化 → 存向量索引（FAISS 或 Qdrant）。
 
 支持 PDF 与 Word(.docx) 两种格式，解析后统一成同一套 metadata 结构
-（source / file_name / page / chunk_id），便于后续混合检索。
+（source / file_name / page / chunk_id / paragraph_start / paragraph_end），
+便于后续混合检索与回答里的精确定位（PDF 用页码，Word 用段落号）。
 
 分块时做中文标题增强：识别章节标题后拼到其下每个 chunk 的正文前，
 形如 "[标题] 第三章 报销流程\n正文…"，提升关键词与向量召回的可定位性。
@@ -68,74 +69,19 @@ def _is_heading(text: str, bold: bool = False) -> bool:
     )
 
 
-def _group_sections(blocks: list[tuple[str, bool]]) -> list[tuple[str | None, str]]:
-    """把 [(文本, 是否标题)] 归并成 [(所属标题, 正文)] 分节。
+def _pdf_page_blocks(page) -> list[tuple[str, bool, int]]:
+    """按 block 顺序读出一页的 [(文本, 是否标题, 页内块号)]。
 
-    标题下没有正文时（如连续两个标题、或文末标题），把标题本身作为独立一节，
-    避免标题文本在切分时被丢掉。
+    页内块号 = 该页中文本块（type=0）的出现顺序，从 1 开始，
+    用于回答里"第 N 段"的精确定位；图片块(type!=0)不占号。
     """
-    sections: list[tuple[str | None, str]] = []
-    heading: str | None = None
-    buffer: list[str] = []
-
-    def flush() -> None:
-        nonlocal heading
-        if buffer:
-            sections.append((heading, "\n".join(buffer)))
-            buffer.clear()
-        elif heading is not None:
-            sections.append((None, heading))
-            heading = None
-
-    for text, is_heading in blocks:
-        if is_heading:
-            flush()
-            heading = text
-        else:
-            buffer.append(text)
-    flush()
-    return sections
-
-
-def _section_to_chunks(
-    splitter: RecursiveCharacterTextSplitter, heading: str | None, text: str
-) -> list[str]:
-    """切分一节正文，并把标题拼到该节每个分块前面。
-
-    形如 "[标题] 第三章 报销流程\\n正文…"；没有标题时原样返回。
-    """
-    pieces = [piece for piece in splitter.split_text(text) if piece.strip()]
-    if not heading:
-        return pieces
-    return [f"[标题] {heading}\n{piece}" for piece in pieces]
-
-
-def _finalize_chunks(chunks: list[Document], file_path: str) -> list[Document]:
-    """统一补 metadata：source / file_name / page / chunk_id。
-
-    chunk_id 形如 "{file_name}_p{page}_{i}"，i 为文档内块序号，
-    供混合检索的 RRF 融合作为唯一 key（同一页的多个分块必须能区分开）。
-    """
-    file_name = os.path.basename(file_path)
-    source = normalize_source(file_path)
-    for i, chunk in enumerate(chunks):
-        page = chunk.metadata.get("page", 0)
-        chunk.metadata = {
-            "source": source,
-            "file_name": file_name,
-            "page": page,
-            "chunk_id": f"{file_name}_p{page}_{i}",
-        }
-    return chunks
-
-
-def _pdf_page_blocks(page) -> list[tuple[str, bool]]:
-    """按 block 顺序读出一页的 [(文本, 是否标题)]。"""
     blocks = []
     # type=0 为文本块，1 为图片块（图片无文字，跳过即可）
+    block_no = 0
     for block in page.get_text("dict").get("blocks", []):
         if block.get("type") != 0:
             continue
+        block_no += 1
 
         lines, bold_chars, total_chars = [], 0, 0
         for line in block.get("lines", []):
@@ -156,8 +102,97 @@ def _pdf_page_blocks(page) -> list[tuple[str, bool]]:
 
         # 整块大部分字符加粗时视为加粗块
         is_bold = total_chars > 0 and bold_chars / total_chars >= 0.6
-        blocks.append((text, _is_heading(text, bold=is_bold)))
+        blocks.append((text, _is_heading(text, bold=is_bold), block_no))
     return blocks
+
+
+def _group_sections(
+    blocks: list[tuple[str, bool, int]],
+) -> list[tuple[str | None, str, int, int]]:
+    """把 [(文本, 是否标题, 位置号)] 归并成 [(所属标题, 正文, 起始位置, 结束位置)] 分节。
+
+    位置号 = PDF 页内文本块号 / Word 段落号（见 _pdf_page_blocks / _docx_blocks）。
+    起始/结束位置取该节覆盖的最小/最大位置号（标题本身的位置也计入），
+    供后续把"第 N-M 段"的精确定位透传到每个分块的 metadata。
+
+    标题下没有正文时（如连续两个标题、或文末标题），把标题本身作为独立一节、
+    其内容就是标题文本、位置为该标题所在位置，避免标题文本在切分时被丢掉。
+    """
+    sections: list[tuple[str | None, str, int, int]] = []
+    heading: str | None = None
+    heading_pos: int | None = None
+    buffer: list[str] = []
+    positions: list[int] = []
+
+    def flush() -> None:
+        nonlocal heading, heading_pos
+        if buffer:
+            sections.append((heading, "\n".join(buffer), positions[0], positions[-1]))
+            buffer.clear()
+            positions.clear()
+        elif heading is not None:
+            pos = heading_pos if heading_pos is not None else 0
+            # heading=None：独立标题段不额外加标题前缀，内容即标题文本
+            sections.append((None, heading, pos, pos))
+            heading = None
+            heading_pos = None
+
+    for text, is_heading, pos in blocks:
+        if is_heading:
+            flush()
+            heading = text
+            heading_pos = pos
+        else:
+            buffer.append(text)
+            positions.append(pos)
+    flush()
+    return sections
+
+
+def _section_to_chunks(
+    splitter: RecursiveCharacterTextSplitter,
+    heading: str | None,
+    text: str,
+    para_start: int,
+    para_end: int,
+) -> list[tuple[str, int, int]]:
+    """切分一节正文，并把标题拼到该节每个分块前面。
+
+    形如 "[标题] 第三章 报销流程\n正文…"；没有标题时原样返回。
+    一个 section 被切分成多个 chunk 时，这些 chunk 共享该 section 的段落范围
+    (para_start, para_end)，作为回答里"第 N-M 段"定位的依据。
+    返回 [(分块文本, 起始位置, 结束位置)]。
+    """
+    pieces = [piece for piece in splitter.split_text(text) if piece.strip()]
+    if not heading:
+        return [(piece, para_start, para_end) for piece in pieces]
+    return [
+        (f"[标题] {heading}\n{piece}", para_start, para_end) for piece in pieces
+    ]
+
+
+def _finalize_chunks(chunks: list[Document], file_path: str) -> list[Document]:
+    """统一补 metadata：source / file_name / page / chunk_id / 段落定位。
+
+    chunk_id 形如 "{file_name}_p{page}_{i}"，i 为文档内块序号，
+    供混合检索的 RRF 融合作为唯一 key（同一页的多个分块必须能区分开）。
+
+    paragraph_start / paragraph_end 由 _split_pdf / _split_docx 写入；
+    旧索引重建前可能缺失（None），不要抛异常，缺失即不写。
+    """
+    file_name = os.path.basename(file_path)
+    source = normalize_source(file_path)
+    for i, chunk in enumerate(chunks):
+        page = chunk.metadata.get("page", 0)
+        chunk.metadata = {
+            "source": source,
+            "file_name": file_name,
+            "page": page,
+            "chunk_id": f"{file_name}_p{page}_{i}",
+            "paragraph_start": chunk.metadata.get("paragraph_start"),
+            "paragraph_end": chunk.metadata.get("paragraph_end"),
+        }
+    return chunks
 
 
 def _docx_paragraph_is_bold(paragraph) -> bool:
@@ -174,20 +209,28 @@ def _docx_is_heading(paragraph) -> bool:
     return _is_heading(paragraph.text, bold=_docx_paragraph_is_bold(paragraph))
 
 
-def _docx_blocks(document) -> list[tuple[str, bool]]:
-    """按段落顺序读出 Word 正文的 [(文本, 是否标题)]，表格行附在最后。"""
+def _docx_blocks(document) -> list[tuple[str, bool, int]]:
+    """按段落顺序读出 Word 正文的 [(文本, 是否标题, 段落号)]，表格行附在最后。
+
+    段落号 = document.paragraphs 的真实下标 + 1（从 1 开始），空段落也占号，
+    这样用户在 Word 里数段落能对上；表格行接在正文段落后继续排号（全局唯一）。
+    """
     blocks = []
-    for paragraph in document.paragraphs:
+    paragraphs = document.paragraphs
+    for idx, paragraph in enumerate(paragraphs, start=1):
         text = paragraph.text.strip()
         if text:
-            blocks.append((text, _docx_is_heading(paragraph)))
+            blocks.append((text, _docx_is_heading(paragraph), idx))
 
     # 表格行用制表符连接以保留行列关系；合并单元格可能重复，轻微重复可接受
+    # 段号从正文段数之后接着排，保证全文段落号唯一、可定位
+    table_row_no = len(paragraphs)
     for table in document.tables:
         for row in table.rows:
             cells = [cell.text.strip() for cell in row.cells]
             if any(cells):
-                blocks.append(("\t".join(cells), False))
+                table_row_no += 1
+                blocks.append(("\t".join(cells), False, table_row_no))
     return blocks
 
 
@@ -200,10 +243,19 @@ def _split_pdf(file_path: str) -> list[Document]:
     with pymupdf.open(file_path) as pdf:
         page_count = pdf.page_count
         for page_number, page in enumerate(pdf, start=1):
-            for heading, text in _group_sections(_pdf_page_blocks(page)):
-                for content in _section_to_chunks(splitter, heading, text):
+            for heading, text, p_start, p_end in _group_sections(_pdf_page_blocks(page)):
+                for content, c_start, c_end in _section_to_chunks(
+                    splitter, heading, text, p_start, p_end
+                ):
                     chunks.append(
-                        Document(page_content=content, metadata={"page": page_number})
+                        Document(
+                            page_content=content,
+                            metadata={
+                                "page": page_number,
+                                "paragraph_start": c_start,
+                                "paragraph_end": c_end,
+                            },
+                        )
                     )
 
     if not chunks:
@@ -229,9 +281,20 @@ def _split_docx(file_path: str) -> list[Document]:
     splitter = _build_splitter()
     chunks: list[Document] = []
 
-    for heading, text in _group_sections(_docx_blocks(document)):
-        for content in _section_to_chunks(splitter, heading, text):
-            chunks.append(Document(page_content=content, metadata={"page": 0}))
+    for heading, text, p_start, p_end in _group_sections(_docx_blocks(document)):
+        for content, c_start, c_end in _section_to_chunks(
+            splitter, heading, text, p_start, p_end
+        ):
+            chunks.append(
+                Document(
+                    page_content=content,
+                    metadata={
+                        "page": 0,
+                        "paragraph_start": c_start,
+                        "paragraph_end": c_end,
+                    },
+                )
+            )
 
     if not chunks:
         logger.warning("Word 无可用文本内容：%s", file_path)

@@ -113,21 +113,43 @@ def api_ask_stream(payload: AskRequest):
 
 
 def _sources_markdown(sources) -> str:
-    """把来源渲染成 Markdown 列表（同文件同页只显示一次）。"""
+    """把来源渲染成带编号的 Markdown 列表（同文件同页同段只显示一次）。
+
+    编号 [i] 来自 retrieval._to_sources 的 index，与回答正文的 (来源：[i])
+    严格对齐。去重 key 加入段落号：Word 没有页码，所有块 page 都是 0，
+    若只用 (file_name, page) 去重会把不同段落误判为重复只显示一条。
+    """
     if not sources:
         return ""
     seen, lines = set(), []
     for s in sources:
-        key = (s.get("file_name"), s.get("page"))
+        para_start = s.get("paragraph_start")
+        # 去重 key：文件 + 页 + 段落起始；段落缺失（旧索引）时退化为 (文件, 页)
+        key = (s.get("file_name"), s.get("page"), para_start)
         if key in seen:
             continue
         seen.add(key)
-        # Word 没有页码（page=0），不显示“第 0 页”，只留文件名
+
         page = s.get("page")
-        lines.append(
-            f"- **{s.get('file_name')}**"
-            + (f" 第 {page} 页" if page else "")
-        )
+        # 位置文本：Word 无页码(page=0)显示"无页码"；PDF 显示"第 N 页"
+        if page and page != 0:
+            loc = f"第 {page} 页"
+        else:
+            loc = "无页码"
+        para_end = s.get("paragraph_end")
+        if para_start is not None and para_end is not None:
+            para = (
+                f"第 {para_start} 段"
+                if para_start == para_end
+                else f"第 {para_start}-{para_end} 段"
+            )
+            loc = f"{loc}，{para}"
+        elif para_start is not None:
+            loc = f"{loc}，第 {para_start} 段"
+
+        idx = s.get("index")
+        prefix = f"[{idx}] " if idx else ""
+        lines.append(f"- {prefix}**{s.get('file_name')}** {loc}")
     return "\n\n---\n**参考来源**\n" + "\n".join(lines)
 
 
@@ -209,7 +231,8 @@ def build_ui() -> gr.Blocks:
     with demo:
         gr.Markdown(
             "# 企业知识库问答\n"
-            "上传 PDF / Word 文档建立知识库，然后基于文档内容提问，回答会自动附带来源与页码。"
+            "上传 PDF / Word 文档建立知识库，然后基于文档内容提问，回答会自动附带来源与定位"
+            "（PDF 显示页码，Word 文档显示段落号）。"
         )
         with gr.Tabs():
             with gr.Tab("知识问答"):

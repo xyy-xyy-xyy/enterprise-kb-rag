@@ -26,7 +26,8 @@ _bm25_cache: tuple[tuple, BM25Okapi | None, list[Document]] | None = None
 
 PROMPT_TEMPLATE = """你是一个企业知识库助手。请根据以下参考资料回答用户问题。
 如果资料中没有相关信息，请如实说明"知识库中未找到相关内容"。
-回答时请引用来源文档和页码。
+引用来源时，请原样使用参考资料中给出的位置标识（如"第 3 页，第 2-4 段"或"无页码，第 12-15 段"）。
+若参考资料标注为"无页码"，就写"无页码"并给出段号；禁止输出"第 0 页"，也不要自行推算页码。
 
 参考资料：
 {context}
@@ -211,28 +212,69 @@ def hybrid_search(query: str, k: int = None) -> list[tuple[Document, float]]:
     return candidates[:k]
 
 
+def _location_label(meta: dict) -> str:
+    """根据 chunk metadata 生成位置标识，供拼接进参考资料与引用。
+
+    - PDF（page>=1）：「第 N 页」；Word（page=0 或无物理页）：「无页码」。
+    - 均带段落范围「第 M 段 / 第 M-N 段」。M 与 N 相等时只写一段。
+    - 任何情况下都不返回"第 0 页"——Word 统一显示"无页码"。
+    - 缺 paragraph_* 字段时降级：PDF 只写页、Word 只写"无页码"。
+    """
+    page = meta.get("page", 0)
+    para_start = meta.get("paragraph_start")
+    para_end = meta.get("paragraph_end")
+
+    if para_start is not None and para_end is not None:
+        para = (
+            f"第 {para_start} 段"
+            if para_start == para_end
+            else f"第 {para_start}-{para_end} 段"
+        )
+    else:
+        para = ""
+
+    if page and page != 0:
+        loc = f"第 {page} 页"
+    else:
+        loc = "无页码"
+
+    return f"{loc}{('，' + para) if para else ''}"
+
+
 def _build_context(results) -> str:
-    """把检索到的片段拼成参考资料文本。"""
+    """把检索到的片段拼成参考资料文本，每个片段带编号 [i] 与位置标识。
+
+    [i] 的编号顺序与 _to_sources 的 index 完全一致（同一 results 列表、同序枚举），
+    这是回答正文 (来源：[2]) 能与界面来源列表对齐的前提。
+    """
     blocks = []
     for i, (doc, _score) in enumerate(results, start=1):
         source = doc.metadata.get("file_name") or doc.metadata.get("source", "未知来源")
-        page = doc.metadata.get("page", "?")
-        blocks.append(f"[{i}] 来源：{source}, 第{page}页\n内容：{doc.page_content}")
+        loc = _location_label(doc.metadata)
+        blocks.append(f"[{i}] 来源：{source}（{loc}）\n内容：{doc.page_content}")
     return "\n\n".join(blocks)
 
 
 def _to_sources(results) -> list[dict]:
-    """把检索结果转成前端的来源列表。"""
+    """把检索结果转成前端的来源列表，序号与 _build_context 的 [i] 严格对齐。
+
+    index 是本次提问的临时序号（1-based），与参考资料里的 [i] 一致，
+    便于用户把正文里的 (来源：[2]) 与界面来源列表对上。
+    注意：index 只是临时编号，不持久化、不写进索引、不参与去重。
+    """
     return [
         {
+            "index": i,
             "source": doc.metadata.get("source", "未知来源"),
             "file_name": doc.metadata.get("file_name")
             or doc.metadata.get("source", "未知来源"),
-            "page": doc.metadata.get("page", "?"),
+            "page": doc.metadata.get("page", 0),
+            "paragraph_start": doc.metadata.get("paragraph_start"),
+            "paragraph_end": doc.metadata.get("paragraph_end"),
             "chunk_id": doc.metadata.get("chunk_id"),
             "snippet": doc.page_content[:100],
         }
-        for doc, _score in results
+        for i, (doc, _score) in enumerate(results, start=1)
     ]
 
 
