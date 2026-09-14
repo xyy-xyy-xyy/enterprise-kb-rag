@@ -22,6 +22,9 @@ app = FastAPI(title="企业知识库 RAG", version="1.0.0")
 class AskRequest(BaseModel):
     question: str
     k: int | None = None
+    # 可选的多轮历史 [{"role": "user"|"assistant", "content": "..."}]；
+    # REST 无状态，历史由前端携带。不传即为单轮，行为与改动前一致。
+    history: list[dict] | None = None
 
 
 # --------------------------- FastAPI 路由 ---------------------------
@@ -83,7 +86,9 @@ async def api_ingest(file: UploadFile = File(...)) -> dict:
 def api_ask(payload: AskRequest) -> dict:
     """提问并返回答案与来源（一次性返回）。"""
     try:
-        return retrieval.answer_question(payload.question, k=payload.k)
+        return retrieval.answer_question(
+            payload.question, k=payload.k, history=payload.history
+        )
     except vector_store.IndexNotReadyError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
@@ -98,7 +103,9 @@ def api_ask_stream(payload: AskRequest):
     """
 
     def event_stream():
-        for event in retrieval.stream_answer(payload.question, k=payload.k):
+        for event in retrieval.stream_answer(
+            payload.question, k=payload.k, history=payload.history
+        ):
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
 
@@ -153,46 +160,80 @@ def _sources_markdown(sources) -> str:
     return "\n\n---\n**参考来源**\n" + "\n".join(lines)
 
 
-def _format_answer(result: dict) -> str:
-    """把回答和来源渲染成 Markdown。"""
-    return (result.get("answer", "") or "") + _sources_markdown(result.get("sources"))
+def ui_chat(user_msg, chat_display, history_state):
+    """多轮对话回调（生成器，Gradio 会逐次 yield 渲染成打字机效果）。
 
+    chat_display : 展示用（每条助手消息 = 头信息 + 答案 + 来源 Markdown）
+    history_state: 喂给 LLM 的干净历史（只有一问一答，不含来源 Markdown）
 
-def ui_ask(question: str):
-    """Gradio 提问回调：生成器形式，Gradio 会把每次 yield 渲染成打字机效果。
-
-    流程：先显示检索中 → 拿到来源后立刻显示"已检索到 N 个片段" →
-    答案随 LLM 增量逐段追加 → 结束后附参考来源。
+    传给 stream_answer 的是【本轮之前】的历史，当前问题由 user_msg 单独传入，
+    不重复塞进 history。
     """
-    if not question or not question.strip():
-        yield "请输入问题。"
+    chat_display = list(chat_display or [])
+    prior_history = list(history_state or [])
+
+    if not user_msg or not user_msg.strip():
+        yield chat_display, "", history_state
         return
 
-    head, sources_md, answer = "⏳ 正在检索知识库…", "", ""
-    yield head
+    # 1) 先把用户消息上屏，并清空输入框
+    chat_display = chat_display + [{"role": "user", "content": user_msg}]
+    yield chat_display, "", history_state
 
-    for event in retrieval.stream_answer(question):
+    # 2) 助手侧先占位"正在检索"
+    chat_display = chat_display + [{"role": "assistant", "content": "⏳ 正在检索知识库…"}]
+    yield chat_display, "", history_state
+
+    head, sources_md, answer = "⏳ 正在检索知识库…", "", ""
+    for event in retrieval.stream_answer(user_msg, history=prior_history):
         etype = event.get("type")
 
         if etype == "sources":
             sources = event.get("sources") or []
             sources_md = _sources_markdown(sources)
             head = f"✅ 已检索到 {len(sources)} 个参考片段"
-            yield f"{head}\n\n{sources_md}".rstrip()
+            content = f"{head}\n\n{sources_md}".rstrip()
 
         elif etype == "delta":
             answer += event.get("text", "")
-            yield f"{head}\n\n{answer}{sources_md}"
+            content = f"{head}\n\n{answer}{sources_md}"
 
         elif etype == "error":
+            message = event.get("message", "处理失败。")
             # 已吐出的答案不回滚，只在后面补一句提示
-            tail = f"\n\n⚠️ {event.get('message', '处理失败。')}"
-            yield (f"{head}\n\n{answer}{tail}{sources_md}" if answer else f"⚠️ {event.get('message', '处理失败。')}")
+            content = (
+                f"{head}\n\n{answer}\n\n⚠️ {message}{sources_md}"
+                if answer
+                else f"⚠️ {message}"
+            )
+            # 重建列表而不是原地改 dict，否则 Gradio 检测不到变化
+            chat_display = chat_display[:-1] + [
+                {"role": "assistant", "content": content}
+            ]
+            yield chat_display, "", history_state
             return
 
         elif etype == "done":
             answer = event.get("answer", answer)
-            yield f"{head}\n\n{answer}{sources_md}"
+            content = f"{head}\n\n{answer}{sources_md}"
+
+        else:
+            continue
+
+        chat_display = chat_display[:-1] + [{"role": "assistant", "content": content}]
+        yield chat_display, "", history_state
+
+    # 3) 本轮结束：把干净的一问一答并入历史（answer 不含来源 Markdown）
+    history_state = prior_history + [
+        {"role": "user", "content": user_msg},
+        {"role": "assistant", "content": answer},
+    ]
+    # 按 MAX_HISTORY_TURNS 截断：窗口外的历史不会再进 prompt，留着只会让
+    # gr.State 随对话轮数无限增长。MAX_HISTORY_TURNS=0 表示关闭历史，直接清空
+    # （注意不能写 [-0:]，Python 会切片出整个列表）。
+    limit = config.MAX_HISTORY_TURNS * 2
+    history_state = history_state[-limit:] if limit > 0 else []
+    yield chat_display, "", history_state
 
 
 def ui_ingest(files):
@@ -232,22 +273,34 @@ def build_ui() -> gr.Blocks:
         gr.Markdown(
             "# 企业知识库问答\n"
             "上传 PDF / Word 文档建立知识库，然后基于文档内容提问，回答会自动附带来源与定位"
-            "（PDF 显示页码，Word 文档显示段落号）。"
+            "（PDF 显示页码，Word 文档显示段落号）。支持多轮追问，如「那交通费怎么算？」"
+            "「它适用于哪些人？」。"
         )
         with gr.Tabs():
             with gr.Tab("知识问答"):
-                question = gr.Textbox(
+                # Gradio 6 的 Chatbot 消息格式固定为 list[dict]（无 type 参数），
+                # 传 type="messages" 会直接 TypeError
+                chatbot = gr.Chatbot(label="对话", height=520)
+                msg = gr.Textbox(
                     label="你的问题",
-                    placeholder="例如：公司的报销流程是怎样的？",
+                    placeholder="例如：外派人员的住宿费标准是什么？",
                     lines=2,
                 )
                 with gr.Row():
                     ask_btn = gr.Button("提问", variant="primary")
                     clear_btn = gr.Button("清空")
-                answer = gr.Markdown(label="回答")
-                ask_btn.click(ui_ask, inputs=question, outputs=answer)
-                question.submit(ui_ask, inputs=question, outputs=answer)
-                clear_btn.click(lambda: ("", ""), outputs=[question, answer])
+                # state 存"干净"历史（一问一答，不含来源 Markdown），喂给 LLM 用；
+                # chatbot 里那份带来源编号，只用于展示
+                state = gr.State([])
+                ask_btn.click(
+                    ui_chat, inputs=[msg, chatbot, state], outputs=[chatbot, msg, state]
+                )
+                msg.submit(
+                    ui_chat, inputs=[msg, chatbot, state], outputs=[chatbot, msg, state]
+                )
+                clear_btn.click(
+                    lambda: ([], "", []), outputs=[chatbot, msg, state]
+                )
 
             with gr.Tab("文档入库"):
                 gr.Markdown(

@@ -40,6 +40,13 @@ RERANK_TOP_N = int(os.getenv("RERANK_TOP_N", "10"))
 # 注意：gte-rerank 已于 2026-05-30 下线，官方迁移目标为 qwen3-rerank
 RERANK_MODEL = os.getenv("RERANK_MODEL", "qwen3-rerank")
 
+# 多轮对话：最多携带的历史轮数（1 轮 = 1 条用户 + 1 条助手）
+MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "5"))
+# 单条历史消息的最大字符数，超出截断，避免 prompt 膨胀
+MAX_HISTORY_CHARS = int(os.getenv("MAX_HISTORY_CHARS", "500"))
+# 多轮检索查询改写：把“那交通费呢”改成独立可检索的查询
+MULTITURN_REWRITE = os.getenv("MULTITURN_REWRITE", "true").lower() == "true"
+
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 # 相对路径统一以项目根目录为基准，避免在 app/ 下运行时找不到文件

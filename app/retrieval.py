@@ -28,15 +28,26 @@ PROMPT_TEMPLATE = """你是一个企业知识库助手。请根据以下参考�
 如果资料中没有相关信息，请如实说明"知识库中未找到相关内容"。
 引用来源时，请原样使用参考资料中给出的位置标识（如"第 3 页，第 2-4 段"或"无页码，第 12-15 段"）。
 若参考资料标注为"无页码"，就写"无页码"并给出段号；禁止输出"第 0 页"，也不要自行推算页码。
-
-参考资料：
+{history_block}参考资料：
 {context}
 
 用户问题：{question}"""
 
+REWRITE_TEMPLATE = """把用户的追问改写成一句能独立理解、用于企业知识库检索的查询词。
+要求：
+1. 只输出改写后的查询本身，不要解释、不要引号、不要换行。
+2. 把上文中的指代（"它""这个""那…呢"等）替换成具体名词。
+3. 只保留追问真正要问的对象，不要把上文无关内容带进来。
+
+对话历史：
+{history}
+
+用户追问：{question}"""
+
 NO_RESULT_ANSWER = "知识库中未找到相关内容。"
 
 _llm = None
+_rewrite_llm = None
 
 
 def get_llm() -> ChatTongyi:
@@ -56,6 +67,24 @@ def get_llm() -> ChatTongyi:
         )
         logger.debug("已初始化 LLM %s（streaming=True）", config.LLM_MODEL)
     return _llm
+
+
+def get_rewrite_llm() -> ChatTongyi:
+    """查询改写专用实例（streaming=False）。
+
+    不复用 get_llm()：那是 streaming=True 的实例，改写只需要一次完整返回，
+    分开可以避免动到主回答链路。
+    """
+    global _rewrite_llm
+    if _rewrite_llm is None:
+        config.validate()
+        _rewrite_llm = ChatTongyi(
+            model_name=config.LLM_MODEL,
+            dashscope_api_key=config.DASHSCOPE_API_KEY,
+            streaming=False,
+        )
+        logger.debug("已初始化查询改写 LLM %s（streaming=False）", config.LLM_MODEL)
+    return _rewrite_llm
 
 
 def _tokenize(text: str) -> list[str]:
@@ -278,24 +307,140 @@ def _to_sources(results) -> list[dict]:
     ]
 
 
-def _prepare_prompt(question: str, k: int) -> tuple[str, list[dict]]:
+def _sanitize_history(history) -> list[dict]:
+    """清洗外部传入的 history，只保留 role 为 user/assistant 且内容非空的项。
+
+    REST 是公开入口，history 来自请求体，必须容忍畸形数据而不是抛异常。
+    """
+    cleaned = []
+    for item in history or []:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        content = item.get("content")
+        if content is None:
+            continue
+        content = str(content).strip()
+        if not content:
+            continue
+        cleaned.append({"role": role, "content": content})
+    return cleaned
+
+
+def _format_history(history: list[dict]) -> str:
+    """渲染成"用户：…/助手：…"纯文本。
+
+    只取最后 MAX_HISTORY_TURNS 轮（一轮 = 2 条消息），单条超长按
+    MAX_HISTORY_CHARS 截断，避免长对话把 prompt 撑爆。
+    """
+    if config.MAX_HISTORY_TURNS <= 0:
+        return ""
+    recent = history[-config.MAX_HISTORY_TURNS * 2 :]
+    lines = []
+    for item in recent:
+        content = item["content"]
+        if len(content) > config.MAX_HISTORY_CHARS:
+            content = content[: config.MAX_HISTORY_CHARS] + "…"
+        speaker = "用户" if item["role"] == "user" else "助手"
+        lines.append(f"{speaker}：{content}")
+    return "\n".join(lines)
+
+
+def _history_block(history: list[dict]) -> str:
+    """生成拼进 PROMPT_TEMPLATE 的历史块；无历史时返回空串，不占版面。
+
+    历史只用于消解指代，必须明写"不得当作事实来源"，否则模型会拿上一轮的
+    回答当依据，脱离本轮参考资料、引用也会失真。
+
+    结尾必须是两个换行：模板里 `{history_block}` 与「参考资料：」同行，
+    无历史时占位符替换为空串，prompt 才能与单轮版本逐字节一致；
+    有历史时这两个换行负责把历史块与参考资料分隔开。
+    """
+    if not history:
+        return ""
+    return (
+        "以下是对话历史，仅用于理解指代（例如“它”“这个比赛”指什么）。\n"
+        "回答必须依据下面的参考资料，不得把对话历史当作事实来源。\n\n"
+        f"{_format_history(history)}\n\n"
+    )
+
+
+def _condense_query(question: str, history: list[dict]) -> str:
+    """把追问改写成可独立检索的查询；任何失败都退回原 question。
+
+    「那交通费怎么算？」这类追问几乎没有可召回的关键词，直接拿去检索会捞回
+    一堆无关分块，所以先借 history 把指代补全。改写失败绝不能让这一轮挂掉。
+    """
+    if not history:
+        return question
+
+    try:
+        response = get_rewrite_llm().invoke(
+            [
+                HumanMessage(
+                    content=REWRITE_TEMPLATE.format(
+                        history=_format_history(history), question=question
+                    )
+                )
+            ]
+        )
+    except Exception:
+        logger.warning("查询改写失败，退回原始问题。", exc_info=True)
+        return question
+
+    raw = (response.content or "").strip()
+    if not raw:
+        logger.warning("查询改写结果为空，退回原始问题。")
+        return question
+
+    # 模型可能带解释文字或引号，只取第一行并去掉首尾引号
+    text = raw.splitlines()[0].strip().strip('"').strip("'").strip()
+    if not text:
+        logger.warning("查询改写结果为空，退回原始问题。")
+        return question
+    return text
+
+
+def _prepare_prompt(
+    question: str, k: int, history: list[dict] | None = None
+) -> tuple[str, list[dict]]:
     """检索 → 拼装 prompt，返回 (prompt, sources)。
 
     无命中时返回 ("", [])：此时不发请求，直接用兜底文案。
+    有历史时先改写查询再检索，但拼给 LLM 的仍是用户原话（改写只影响检索）。
     """
-    results = hybrid_search(question, k=k)
+    history = _sanitize_history(history or [])
+    search_query = (
+        _condense_query(question, history)
+        if (config.MULTITURN_REWRITE and history)
+        else question
+    )
+    if search_query != question:
+        logger.info("多轮检索改写：%r → %r", question, search_query)
+
+    results = hybrid_search(search_query, k=k)
     if not results:
         logger.info("检索无结果，直接返回兜底回答。")
         return "", []
     return (
-        PROMPT_TEMPLATE.format(context=_build_context(results), question=question),
+        PROMPT_TEMPLATE.format(
+            context=_build_context(results),
+            question=question,
+            history_block=_history_block(history),
+        ),
         _to_sources(results),
     )
 
 
-def answer_question(question: str, k: int = None) -> dict:
+def answer_question(
+    question: str, k: int = None, history: list[dict] | None = None
+) -> dict:
     """检索并生成回答，返回 {"answer": str, "sources": List[dict]}。
 
+    history 为可选的多轮对话历史 [{"role","content"}]；
+    不传时行为与单轮完全一致。
     索引缺失时抛出 vector_store.IndexNotReadyError，由调用方决定如何提示。
     """
     config.setup_logging()
@@ -304,7 +449,7 @@ def answer_question(question: str, k: int = None) -> dict:
     if not question or not question.strip():
         return {"answer": "请输入问题。", "sources": []}
 
-    prompt, sources = _prepare_prompt(question, k)
+    prompt, sources = _prepare_prompt(question, k, history)
     if not prompt:
         return {"answer": NO_RESULT_ANSWER, "sources": []}
 
@@ -321,7 +466,9 @@ def answer_question(question: str, k: int = None) -> dict:
     return {"answer": response.content, "sources": sources}
 
 
-def stream_answer(question: str, k: int = None) -> Iterator[dict]:
+def stream_answer(
+    question: str, k: int = None, history: list[dict] | None = None
+) -> Iterator[dict]:
     """流式问答：以事件形式产出，供 Gradio 打字机效果与 SSE 接口共用。
 
     事件类型：
@@ -330,6 +477,7 @@ def stream_answer(question: str, k: int = None) -> Iterator[dict]:
         {"type": "done",    "answer": str, "sources": [...]}
         {"type": "error",   "message": str}    检索或生成失败（已吐出的文本不回滚）
 
+    history 为可选的多轮历史；Gradio 与 /api/ask/stream 都靠它实现多轮。
     与 answer_question 共用 _prepare_prompt，保证两条路径的检索行为完全一致。
     """
     config.setup_logging()
@@ -340,7 +488,7 @@ def stream_answer(question: str, k: int = None) -> Iterator[dict]:
         return
 
     try:
-        prompt, sources = _prepare_prompt(question, k)
+        prompt, sources = _prepare_prompt(question, k, history)
     except vector_store.IndexNotReadyError as exc:
         yield {"type": "error", "message": str(exc)}
         return

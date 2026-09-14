@@ -2,7 +2,7 @@
 
 基于 **RAG（检索增强生成）** 的企业知识库问答系统。上传 PDF / Word(.docx) 文档，系统自动完成解析、分块、向量化与索引构建；提问时检索相关片段，交由大模型生成**带引用来源与定位（PDF 页码 / Word 段落号）**的回答。
 
-> **当前状态**：阶段一（最小可用 RAG 链路）已完成；阶段二（核心功能完善）进行中。
+> **当前状态**：阶段一（最小可用 RAG 链路）、阶段二（核心功能完善：混合检索 / Reranker / 流式输出 / 多轮对话）已完成。
 > 详细实施计划与进度见 [`路线图进度.md`](路线图进度.md)。
 
 ---
@@ -23,13 +23,12 @@
 | **混合检索** | 向量召回 + BM25 关键词召回（jieba 中文分词），RRF（k=60）融合，可用 `HYBRID_RETRIEVAL=false` 关闭 |
 | **Reranker 重排** | DashScope `qwen3-rerank` API 对 top-N 候选重排；API 失败自动降级为 RRF 顺序 |
 | 引用溯源 | 回答末尾列出来源文件名；PDF 显示「第 N 页 第 M-N 段」，Word 显示「无页码 第 M-N 段」；带 [i] 编号并与正文 (来源：[i]) 对齐；自动去重 |
+| **多轮对话** | 支持「那交通费怎么算？」「它适用于哪些人？」等指代式追问；检索前用 LLM 把追问改写成独立查询（Query Rewrite），改写只影响检索、不影响回答 |
 | 双入口 | FastAPI REST 接口 + Gradio 可视化界面（同一进程挂载） |
 | 失败回滚 | 上传采用临时文件中转，入库失败自动清理，不污染知识库 |
 
-### 🔄 规划中（对应路线图阶段二 ~ 五）
+### 🔄 规划中（对应路线图阶段三 ~ 五）
 
-- 多轮对话
-- 查询改写（Query Rewrite）
 - **国密安全层**：SM4 文档加密存储 + SM3 完整性校验 + 内容去重
 - **RAG 质量评测体系**：Hit Rate / MRR / LLM-as-judge 对比实验
 
@@ -112,12 +111,21 @@ HYBRID_RETRIEVAL=true
 RERANK_ENABLED=true
 RERANK_TOP_N=10
 RERANK_MODEL=qwen3-rerank
+
+# 多轮对话
+MAX_HISTORY_TURNS=5
+MAX_HISTORY_CHARS=500
+MULTITURN_REWRITE=true
 ```
 
 > **关于 Reranker**：走 DashScope API（`TextReRank`），不下载本地模型。
 > `gte-rerank` 已于 2026-05-30 下线，默认改用官方迁移目标 `qwen3-rerank`；
 > 模型名通过 `RERANK_MODEL` 配置，后续如有变更改 `.env` 一行即可，无需改代码。
 > API 调用失败会自动降级为 RRF 融合结果，不中断问答。
+
+> **关于多轮对话**：历史由前端携带（REST 无状态）。**第一轮不传历史时不会调用改写**，
+> 行为与单轮完全一致；改写失败会记 warning 并回退用原问题检索，不中断问答。
+> `MULTITURN_REWRITE=false` 可关闭改写（仍保留历史进 prompt）。
 
 > 使用 Qdrant 后端时，启动服务前请先确保 Docker 中的 Qdrant 在运行：
 > ```bash
@@ -149,7 +157,8 @@ venv\Scripts\python.exe -m uvicorn app.main:app --port 8000 --reload
 Windows 用户也可以直接双击 `启动服务.bat`（会检查索引并启动；Qdrant 模式下请先确保 Docker 中 Qdrant 已运行）。
 
 浏览器打开 <http://localhost:8000> 使用 Gradio 界面（知识问答 + 文档入库两个 Tab）。
-知识问答为流式输出：先显示"已检索到 N 个参考片段"，答案逐字追加，结束后列出参考来源。
+知识问答为多轮对话式（Chatbot）+ 流式输出：先显示"已检索到 N 个参考片段"，
+答案逐字追加，结束后列出参考来源；同一会话内可直接用「它」「那…呢」追问。
 
 ---
 
@@ -159,8 +168,8 @@ Windows 用户也可以直接双击 `启动服务.bat`（会检查索引并启�
 |---|---|---|
 | GET | `/api/health` | 健康检查，返回模型名、后端类型与索引状态 |
 | POST | `/api/ingest` | 上传 PDF / Word 并入库（multipart/form-data） |
-| POST | `/api/ask` | 提问，返回答案与来源列表（等待完整生成后一次性返回） |
-| POST | `/api/ask/stream` | 提问，**SSE 流式返回**（`sources` → 多个 `delta` → `done`，结束发 `data: [DONE]`） |
+| POST | `/api/ask` | 提问，返回答案与来源列表（等待完整生成后一次性返回）；可选传 `history` 多轮追问 |
+| POST | `/api/ask/stream` | 提问，**SSE 流式返回**（`sources` → 多个 `delta` → `done`，结束发 `data: [DONE]`）；可选传 `history` |
 
 示例：
 
@@ -169,6 +178,24 @@ curl -X POST http://localhost:8000/api/ask \
   -H "Content-Type: application/json" \
   -d "{\"question\": \"文档中提到的流程有哪些？\"}"
 ```
+
+多轮追问（历史由前端携带，格式为 `{"role": "user"|"assistant", "content": "..."}`）：
+
+```bash
+curl -X POST http://localhost:8000/api/ask \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "那交通费怎么算？",
+    "history": [
+      {"role": "user", "content": "外派人员的住宿费标准是什么？"},
+      {"role": "assistant", "content": "住宿费按城市分档，一线城市每晚上限 500 元……"}
+    ]
+  }'
+```
+
+> `history` 不传或传空数组即单轮，行为与之前完全一致；
+> 传了历史时系统会先把追问改写成独立查询再检索（日志打印 `多轮检索改写：… → …`），
+> 但**回答仍基于用户原始问题生成**，避免改写偏差影响答案。
 
 返回：
 
@@ -212,7 +239,7 @@ enterprise-kb-rag/
 │   ├── config.py          # 环境变量与全局配置、日志初始化
 │   ├── vector_store.py    # 向量索引（FAISS + Qdrant 双后端抽象层）
 │   ├── ingestion.py       # 文档(PDF/Word) → 分块 → 向量化 → 入库（含去重与回滚）
-│   ├── retrieval.py       # 检索 → 拼装 Prompt → 调用 LLM → 返回答案与来源
+│   ├── retrieval.py       # 检索（混合+重排）→ 多轮查询改写 → 拼装 Prompt → 调用 LLM
 │   └── main.py            # FastAPI 路由 + Gradio 界面挂载
 ├── data/
 │   └── docs/              # 知识库原始文档 PDF/Word（自行放入，不纳入 Git）
@@ -240,7 +267,7 @@ enterprise-kb-rag/
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | 一 | 环境搭建与最小 RAG 链路（双后端可用） | ✅ 完成 |
-| 二 | 混合检索、Reranker、流式输出（已完成）；多轮对话待做 | 🔄 进行中 |
+| 二 | 混合检索、Reranker、流式输出、多轮对话 | ✅ 完成 |
 | 三 | 国密安全层（SM4 加密 + SM3 校验 + 内容去重） | ⬜ 待开始 |
 | 四 | RAG 质量评测体系（Hit Rate / MRR / LLM-judge） | ⬜ 待开始 |
 | 五 | 单元测试、CI、Docker 部署、文档与演示材料 | ⬜ 待开始 |
@@ -252,7 +279,9 @@ enterprise-kb-rag/
 - 当前支持 PDF 与 Word(.docx)；尚未支持 Markdown、扫描件图片（图片内文字读不到）。
 - 重复入库判断基于**归一化文件路径**：同一份 PDF 改名后重传会被当成新文档重复入库（计划用 SM3 内容摘要替代，顺便兼做完整性校验）。
 - 不支持文档删除：删除 `data/docs/` 中的文件后，索引里的分块不会同步移除（需 `--rebuild` 重建）。
-- 单次提问无上下文记忆，暂不支持多轮对话（阶段二规划）。
+- 多轮对话的历史**只在单次请求内有效**：REST 无状态，历史由前端携带（Gradio 用 `gr.State` 存）；服务端不保存会话。
+- 历史仅用于**消解指代**，不作为事实依据（prompt 里已明确要求），且最多携带 `MAX_HISTORY_TURNS` 轮、单条截断到 `MAX_HISTORY_CHARS` 字符。
+- 会话过长时早期轮次会被截断，指代到很早之前的对象可能失效。
 - 流式输出为同步生成器实现，`/api/ask/stream` 每次请求占用一个线程（当前知识库规模下无压力）。
 - Qdrant 后端依赖 Docker 服务运行；服务未启动时报错而非静默降级。
 
