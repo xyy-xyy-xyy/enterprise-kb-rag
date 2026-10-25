@@ -11,7 +11,11 @@ load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 
 DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen-plus")
-EMBEDDING_MODEL = "text-embedding-v2"  # DashScope 默认嵌入模型
+# LLM 走 OpenAI 兼容端点：qwen3.8 等新模型只发布在 DashScope 的 compatible-mode
+# 端点上，老的 ChatTongyi 原生 SDK 端点会报 "url error"。换供应商（如 DeepSeek）
+# 时也只需改这行 + API key + 模型名，代码不动。
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+EMBEDDING_MODEL = "qwen3.7-text-embedding-flash"  # DashScope 默认嵌入模型
 
 FAISS_INDEX_PATH = os.getenv("FAISS_INDEX_PATH", "data/faiss_index")
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "500"))

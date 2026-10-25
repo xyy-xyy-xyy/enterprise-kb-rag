@@ -11,7 +11,7 @@ import json
 import logging
 import re
 
-import dashscope
+import openai
 
 from app import config
 
@@ -92,20 +92,32 @@ def _coerce_score(value) -> int:
     return max(0, min(5, score))
 
 
+_judge_client = None
+
+
+def _get_judge_client() -> openai.OpenAI:
+    """返回 OpenAI 兼容客户端（进程内复用）。
+
+    走 config.LLM_BASE_URL（DashScope compatible-mode 端点）：qwen3.8 等
+    新模型只在这个端点提供，老的 dashscope.Generation 原生端点会报 url error。
+    """
+    global _judge_client
+    if _judge_client is None:
+        _judge_client = openai.OpenAI(
+            api_key=config.DASHSCOPE_API_KEY,
+            base_url=config.LLM_BASE_URL,
+        )
+    return _judge_client
+
+
 def _call_judge(model: str, prompt: str) -> str:
     """调用裁判模型，返回原始文本；失败抛异常由上层接住。"""
-    response = dashscope.Generation.call(
+    response = _get_judge_client().chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": prompt}],
-        api_key=config.DASHSCOPE_API_KEY,
-        result_format="message",
         temperature=0.0,  # 评测要可复现，不要采样随机性
     )
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"裁判模型 {model} 返回 {response.status_code}：{getattr(response, 'message', '')}"
-        )
-    return response.output.choices[0].message.content or ""
+    return response.choices[0].message.content or ""
 
 
 def judge_answer(question: str, expected_answer: str, answer: str) -> dict | None:

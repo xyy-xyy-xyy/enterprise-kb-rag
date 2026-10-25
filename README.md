@@ -321,7 +321,7 @@ venv\Scripts\python.exe -m pytest -q
 | `tests/test_eval_report.py` | 评测报告渲染与结论生成（阶段四交付物的生成逻辑） |
 | `tests/test_vector_store.py` | 双后端分发、索引存在性、Qdrant payload 解析与降级 |
 | `tests/test_crypto_cli.py` | `--encrypt-all` / `--decrypt-all` / `--verify-all` 等 CLI 子命令 |
-| `tests/test_main.py` | `/api/health`、`/api/ask`、SSE 流、`/api/ingest`、来源渲染 |
+| `tests/test_main.py` | `/api/health`、`/api/ask`、SSE 流、`/api/ingest`、`DELETE /api/documents`、来源渲染 |
 | `tests/test_crypto.py` | SM3 / SM4 原语与加解密（阶段三既有 37 个用例） |
 | `tests/test_integration.py` | **全部标 `integration`，CI 不跑**：真实检索问答与真实入库 |
 
@@ -407,6 +407,7 @@ venv\Scripts\python.exe -m app.eval.run_eval --rejudge
 | POST | `/api/ingest` | 上传 PDF / Word 并入库（multipart/form-data） |
 | POST | `/api/ask` | 提问，返回答案与来源列表（等待完整生成后一次性返回）；可选传 `history` 多轮追问 |
 | POST | `/api/ask/stream` | 提问，**SSE 流式返回**（`sources` → 多个 `delta` → `done`，结束发 `data: [DONE]`）；可选传 `history` |
+| DELETE | `/api/documents/{filename}` | 按文件名删除文档：同步移除索引分块（FAISS 原生按 id 删 / Qdrant 按 source 过滤删）与磁盘源文件（明文 / `.enc` / `.bak`），返回删除统计 |
 
 示例：
 
@@ -527,8 +528,7 @@ enterprise-kb-rag/
 - 当前支持 PDF 与 Word(.docx)；尚未支持 Markdown、扫描件图片（图片内文字读不到）。
 - **CI 只跑离线单元测试**：`integration` 标记的用例需要真实 `DASHSCOPE_API_KEY` 与运行中的 Qdrant，只能在本地跑。CI 里的 `DASHSCOPE_API_KEY` 是一个假值，只为了让 `config.validate()` 不抛异常，**不会发出任何真实请求**（相关用例已全部标记跳过）。
 - 覆盖率基线为 CI 环境实测的 **76.25%**，其中 `app/vector_store.py` 的 Qdrant 分支、`app/eval/` 里需要调 LLM 的评测流程、`app/main.py` 的 Gradio 布局代码天然难以离线覆盖 —— 这些是真实缺口，没有用排除统计的方式修饰。
-- 不支持文档删除：删除 `data/docs/` 中的文件后，索引里的分块不会同步移除（需 `--rebuild` 重建）。
-- 同一份文档**改了内容但保持同名**时，仍会被 `source` 去重拦下（既有行为，未改成覆盖更新），需要先做文档删除才能重新入库 —— 这也是上一条的连带影响。
+- 同一份文档**改了内容但保持同名**时，重新入库仍会被 `source` 去重拦下（未改成覆盖更新）：请先调用 `DELETE /api/documents/{文件名}` 删除旧版本，再重新入库。
 
 ### 国密安全层的边界（详见 [`SECURITY.md`](SECURITY.md)）
 

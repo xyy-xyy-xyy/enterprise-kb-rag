@@ -367,3 +367,107 @@ def test_api_ingest_preserves_the_previous_file_when_replacing_fails(
     # 文件仍在（无论是明文还是密文形态），目录里没有多余的临时文件
     remaining = sorted(p.name for p in tmp_path.iterdir())
     assert remaining in (["existing.docx"], ["existing.docx.enc"]), remaining
+
+
+# ============================ DELETE /api/documents/{filename} ============================
+
+
+def test_api_delete_removes_chunks_and_every_file_form(monkeypatch, client, tmp_path):
+    """删除 = 索引分块 + 磁盘上明文/密文/.bak 三种形态一起清，BM25 缓存同步失效。"""
+    from app import config, retrieval, vector_store
+
+    monkeypatch.setattr(config, "DOCS_PATH", str(tmp_path))
+    (tmp_path / "旧制度.pdf.enc").write_bytes(b"cipher")
+    (tmp_path / "旧制度.pdf.bak").write_bytes(b"plaintext-backup")
+
+    seen = {}
+    monkeypatch.setattr(
+        vector_store,
+        "delete_document_chunks",
+        lambda name: (
+            seen.setdefault("name", name),
+            (7, [str(tmp_path / "旧制度.pdf")]),
+        )[1],
+    )
+    invalidated = []
+    monkeypatch.setattr(retrieval, "invalidate_bm25_cache", lambda: invalidated.append(True))
+
+    response = client.delete("/api/documents/旧制度.pdf")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {
+        "status": "success",
+        "file": "旧制度.pdf",
+        "chunks_deleted": 7,
+        "source_files_removed": ["旧制度.pdf.enc", "旧制度.pdf.bak"],
+    }
+    assert seen["name"] == "旧制度.pdf"
+    assert invalidated == [True], "删除后必须显式清 BM25 缓存"
+    assert list(tmp_path.iterdir()) == [], "磁盘上不该留下任何形态的源文件"
+
+
+def test_api_delete_returns_404_when_nothing_matches(monkeypatch, client, tmp_path):
+    """索引里没有、磁盘上也没有：404，而不是把空删除当成功。"""
+    from app import config, vector_store
+
+    monkeypatch.setattr(config, "DOCS_PATH", str(tmp_path))
+    monkeypatch.setattr(vector_store, "delete_document_chunks", lambda name: (0, []))
+
+    response = client.delete("/api/documents/ghost.pdf")
+
+    assert response.status_code == 404
+    assert "ghost.pdf" in response.json()["detail"]
+
+
+def test_api_delete_rejects_path_traversal(monkeypatch, client, tmp_path):
+    """带路径分隔符的文件名一律 400：不能穿越出知识库目录删任意文件。
+
+    路由参数匹配不到 "/"，但 URL 编码的 "\\"（%5C）能塞进单个路径段，
+    Windows 下这正是目录穿越的入口，必须靠 basename 校验拦住。
+    """
+    from app import config
+
+    monkeypatch.setattr(config, "DOCS_PATH", str(tmp_path))
+
+    response = client.delete("/api/documents/..%5C..%5Csecret.pdf")
+
+    assert response.status_code == 400
+    assert "纯文件名" in response.json()["detail"]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_api_delete_still_removes_the_file_when_index_is_not_ready(monkeypatch, client, tmp_path):
+    """索引还没建过：删磁盘文件仍然是有意义的动作，响应里说明索引未就绪。"""
+    from app import config, vector_store
+
+    monkeypatch.setattr(config, "DOCS_PATH", str(tmp_path))
+    (tmp_path / "a.pdf").write_bytes(b"plain")
+
+    def raise_not_ready(name):
+        raise vector_store.IndexNotReadyError("未找到索引文件")
+
+    monkeypatch.setattr(vector_store, "delete_document_chunks", raise_not_ready)
+
+    response = client.delete("/api/documents/a.pdf")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["chunks_deleted"] == 0
+    assert "索引" in body["warning"]
+    assert not (tmp_path / "a.pdf").exists()
+
+
+def test_api_delete_returns_404_when_index_is_unready_and_file_is_missing(
+    monkeypatch, client, tmp_path
+):
+    from app import config, vector_store
+
+    monkeypatch.setattr(config, "DOCS_PATH", str(tmp_path))
+
+    def raise_not_ready(name):
+        raise vector_store.IndexNotReadyError("未找到索引文件")
+
+    monkeypatch.setattr(vector_store, "delete_document_chunks", raise_not_ready)
+
+    assert client.delete("/api/documents/ghost.pdf").status_code == 404

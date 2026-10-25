@@ -22,6 +22,8 @@ import pymupdf  # noqa: E402
 import pytest  # noqa: E402
 from langchain_core.documents import Document  # noqa: E402
 
+from app import vector_store  # noqa: E402
+
 # 让测试能 `import app.*`：pytest 默认只把 tests/ 加进 sys.path，
 # `python -m pytest` 恰好能用是因为 cwd 在 path 里，裸 `pytest`（CI 的用法）就不行。
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -40,6 +42,18 @@ def _warm_up_jieba():
 
     jieba.lcut("预热分词")
     return True
+
+
+@pytest.fixture(autouse=True)
+def _reset_index_cache():
+    """清空 vector_store 的索引实例缓存。
+
+    缓存是模块级状态：上一个用例塞进去的桩实例若被下一个用例的 load_index()
+    直接命中，测试就会"串味"。这里每个用例前后各清一次，保证确定性。
+    """
+    vector_store.invalidate_index_cache()
+    yield
+    vector_store.invalidate_index_cache()
 
 
 # --------------------------- PDF 语料 ---------------------------

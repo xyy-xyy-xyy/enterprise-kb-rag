@@ -42,7 +42,7 @@ LIMITATIONS = """\
 - **命中判定为文档级**：只判断"有没有捞到对的那份文档"，未精确到分块；
   真实问答中"捞对了文档但捞错了段落"同样会导致答错，本指标看不出来。
 - **知识库规模小**：索引共 {chunk_count} 个分块 / {doc_count} 份文档，
-  四套方案在这么小的语料上召回高度重叠，结论外推到大规模语料需谨慎。
+  各方案在这么小的语料上召回高度重叠，结论外推到大规模语料需谨慎。
 {completeness_caveat}{hit_at_k_ceiling}"""
 
 
@@ -321,7 +321,9 @@ def render_report(payload: dict) -> str:
         out.append(f"| 本次限制 | 仅前 {payload['limit']} 条 |")
     out.append("")
 
-    out.append("## 二、四方案主表\n")
+    # 标题按实际参评方案数生成：跳过部分策略（如 --strategies）时不能还写"四方案"
+    count_text = {1: "单", 2: "两", 3: "三", 4: "四"}.get(len(strategies), str(len(strategies)))
+    out.append(f"## 二、{count_text}方案主表\n")
     out.append(f"| 方案 | Hit@1 | Hit@{k} | MRR | 准确性 | 相关性 | 完整性 |")
     out.append("|---|---|---|---|---|---|---|")
     for name in strategies:
@@ -363,7 +365,7 @@ def render_report(payload: dict) -> str:
     if len(hit_k_values) == 1:
         one = next(iter(hit_k_values))
         hit_at_k_ceiling = (
-            f"- **Hit@{k} 已触顶、失去区分度**：四个方案的 Hit@{k} 都是 {_pct(one)}。"
+            f"- **Hit@{k} 已触顶、失去区分度**：各方案的 Hit@{k} 都是 {_pct(one)}。"
             f"本语料只有 {meta['doc_count']} 份文档，top-{k} 几乎必然覆盖到正确文档，"
             "该指标区分不了方案；实际差异要看 Hit@1 与 MRR。\n"
         )
@@ -380,7 +382,7 @@ def render_report(payload: dict) -> str:
     if comps and max(comps) < 3.0:
         completeness_caveat = (
             "- **完整性分的绝对值偏低，别当成「答案不完整」读**："
-            f"四个方案的完整性均分都在 {min(comps):.1f}~{max(comps):.1f} 分区间，"
+            f"各方案的完整性均分都在 {min(comps):.1f}~{max(comps):.1f} 分区间，"
             "裁判很可能在对「答案比标准答案更长」或「附带了来源引用」扣分。"
             "该分数横向可比，但绝对值更多反映裁判的严格程度，而非答案真实完整度。\n"
         )

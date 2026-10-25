@@ -5,6 +5,7 @@
 
 import logging
 import os
+import threading
 
 from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_core.documents import Document
@@ -38,6 +39,35 @@ def get_embeddings() -> DashScopeEmbeddings:
     return _embeddings
 
 
+# 索引实例缓存：(缓存键, vectorstore)。键 = 后端 + 索引位置（FAISS 目录 /
+# Qdrant collection），切换后端或路径自动失效；重建 / 删除文档时显式 invalidate。
+# 之前每个请求都重新 load：FAISS 要从磁盘反序列化整个索引、Qdrant 要新建连接，
+# 这是检索延迟的大头；进程内缓存一次即可。
+_index_cache: tuple[tuple, object] | None = None
+_index_lock = threading.Lock()
+
+
+def _cache_key() -> tuple:
+    """当前配置下的缓存键，任何影响"指向哪个索引"的配置变化都会换键。"""
+    if config.VECTOR_BACKEND == "qdrant":
+        return ("qdrant", config.QDRANT_HOST, config.QDRANT_PORT, config.QDRANT_COLLECTION)
+    return ("faiss", config.INDEX_DIR)
+
+
+def _set_cached_index(vectorstore) -> None:
+    """把新建的索引实例写入进程缓存。"""
+    global _index_cache
+    with _index_lock:
+        _index_cache = (_cache_key(), vectorstore)
+
+
+def invalidate_index_cache() -> None:
+    """清空进程内的索引实例缓存（重建索引、删除文档后必须调用）。"""
+    global _index_cache
+    with _index_lock:
+        _index_cache = None
+
+
 # ============================ 后端抽象层 ============================
 
 
@@ -51,13 +81,16 @@ def index_exists() -> bool:
 
 
 def create_index(documents: list[Document]):
-    """用文档分块新建索引，返回 vectorstore。"""
+    """用文档分块新建索引，返回 vectorstore（新实例同时写入进程缓存）。"""
     if not documents:
         raise ValueError("文档分块为空，无法建立索引。")
     logger.info("正在向量化 %d 个分块并建立新索引...", len(documents))
     if config.VECTOR_BACKEND == "qdrant":
-        return _qdrant_create(documents)
-    return _faiss_create(documents)
+        vectorstore = _qdrant_create(documents)
+    else:
+        vectorstore = _faiss_create(documents)
+    _set_cached_index(vectorstore)
+    return vectorstore
 
 
 def add_documents(vectorstore, documents: list[Document]):
@@ -85,10 +118,25 @@ def save_index(vectorstore) -> str:
 
 
 def load_index():
-    """加载索引；不存在时抛出 IndexNotReadyError。"""
+    """加载索引；不存在时抛出 IndexNotReadyError。
+
+    命中进程缓存直接返回；未命中才真正加载（FAISS 反序列化 / Qdrant 建连接）。
+    实际加载放在锁外执行：可能耗时数秒，不该阻塞其他线程读缓存。
+    """
+    global _index_cache
+    key = _cache_key()
+    with _index_lock:
+        if _index_cache is not None and _index_cache[0] == key:
+            return _index_cache[1]
     if config.VECTOR_BACKEND == "qdrant":
-        return _qdrant_load()
-    return _faiss_load()
+        vectorstore = _qdrant_load()
+    else:
+        vectorstore = _faiss_load()
+    with _index_lock:
+        # 双检：加载期间其他线程可能已装填同键缓存，以先到的为准
+        if _index_cache is None or _index_cache[0] != key:
+            _index_cache = (key, vectorstore)
+    return _index_cache[1]
 
 
 def get_index():
@@ -162,7 +210,11 @@ def _collect_hashes(metadatas) -> dict[str, str]:
 
 
 def reset_index() -> None:
-    """删除索引（用于重建）。"""
+    """删除索引（用于重建），并清空进程内的索引实例缓存。
+
+    缓存必须先清：否则 reset 后第一次 load 会"成功"返回已删除索引的旧实例。
+    """
+    invalidate_index_cache()
     if config.VECTOR_BACKEND == "qdrant":
         _qdrant_reset()
         return
@@ -171,6 +223,37 @@ def reset_index() -> None:
         if os.path.exists(path):
             os.remove(path)
             logger.info("已删除旧索引文件：%s", path)
+
+
+def delete_document_chunks(target_name: str) -> tuple[int, list[str]]:
+    """从索引中删除一个文档的全部分块，返回 (删除的分块数, 命中的 source 列表)。
+
+    匹配规则：分块 metadata 的 file_name 或 source 的文件名部分与 target_name
+    一致（经 os.path.normcase 归一化，Windows 下不区分大小写）。
+    索引未就绪时抛 IndexNotReadyError，由调用方决定后续动作。
+
+    FAISS：按 docstore id 走 FAISS.delete 原生删除，不重算任何向量；
+    Qdrant：按 metadata.source 过滤删除，由服务端完成。
+    """
+    if config.VECTOR_BACKEND == "qdrant":
+        return _qdrant_delete_by_name(target_name)
+    vectorstore = load_index()
+    deleted, sources = _faiss_delete_by_name(vectorstore, target_name)
+    if deleted:
+        # FAISS 的删除只发生在内存里，必须落盘，否则重启后会"复活"
+        save_index(vectorstore)
+    return deleted, sources
+
+
+def _matches_target(meta: dict, target_name: str) -> bool:
+    """分块 metadata 是否属于 target_name 对应的文档。"""
+    file_name = meta.get("file_name")
+    if file_name and os.path.normcase(file_name) == os.path.normcase(target_name):
+        return True
+    source = meta.get("source")
+    return bool(source) and os.path.normcase(
+        os.path.basename(source)
+    ) == os.path.normcase(target_name)
 
 
 # ============================ FAISS 后端 ============================
@@ -224,6 +307,22 @@ def _faiss_get_hashes(vectorstore=None) -> dict[str, str]:
     )
 
 
+def _faiss_delete_by_name(vectorstore, target_name: str) -> tuple[int, list[str]]:
+    """收集目标文档的分块 id，交给 FAISS.delete 原生删除（索引与 docstore 同步更新）。"""
+    ids, sources = [], set()
+    for doc_id, doc in vectorstore.docstore._dict.items():
+        meta = doc.metadata or {}
+        if _matches_target(meta, target_name):
+            ids.append(doc_id)
+            if meta.get("source"):
+                sources.add(meta["source"])
+    if not ids:
+        return 0, []
+    vectorstore.delete(ids)
+    logger.info("已从 FAISS 索引删除 %d 个分块（%s）。", len(ids), target_name)
+    return len(ids), sorted(sources)
+
+
 # ============================ Qdrant 后端 ============================
 
 
@@ -270,7 +369,11 @@ def _qdrant_create(documents: list[Document]):
 
     client = _get_qdrant_client()
     embedding_dim = len(get_embeddings().embed_query("test"))
-    client.recreate_collection(
+    # 不用 recreate_collection：它已被 qdrant-client 标记为弃用，未来版本会移除。
+    # 显式「先删后建」语义完全等价，且不依赖该兼容方法。
+    if _qdrant_collection_exists():
+        client.delete_collection(config.QDRANT_COLLECTION)
+    client.create_collection(
         collection_name=config.QDRANT_COLLECTION,
         vectors_config=VectorParams(size=embedding_dim, distance=Distance.COSINE),
     )
@@ -376,6 +479,56 @@ def _qdrant_get_all_documents() -> list[Document]:
             Document(page_content=content, metadata=payload.get("metadata") or {})
         )
     return documents
+
+
+def _qdrant_delete_by_name(target_name: str) -> tuple[int, list[str]]:
+    """按 metadata.source 过滤删除 Qdrant 里的分块。
+
+    filter 必须用 source 的精确值（归一化绝对路径），所以先 scroll 拿到
+    该文件名对应的全部 source，再交给服务端按条件删除。
+    """
+    from qdrant_client import models
+
+    if not _qdrant_collection_exists():
+        raise IndexNotReadyError(
+            f"Qdrant collection '{config.QDRANT_COLLECTION}' 不存在，"
+            f"请先运行 `python -m app.ingestion` 入库。"
+        )
+    client = _get_qdrant_client()
+    points, _ = client.scroll(
+        collection_name=config.QDRANT_COLLECTION,
+        limit=10000,
+        with_payload=["metadata.source", "metadata.file_name"],
+        with_vectors=False,
+    )
+    sources = set()
+    for point in points:
+        meta = (point.payload or {}).get("metadata") or {}
+        if meta.get("source") and _matches_target(meta, target_name):
+            sources.add(meta["source"])
+    if not sources:
+        return 0, []
+
+    # 同名文件可能从不同目录入库过（source 不同），用 should = OR 全部删掉
+    source_filter = models.Filter(
+        should=[
+            models.FieldCondition(
+                key="metadata.source", match=models.MatchValue(value=source)
+            )
+            for source in sources
+        ]
+    )
+    count = client.count(
+        collection_name=config.QDRANT_COLLECTION,
+        count_filter=source_filter,
+        exact=True,
+    ).count
+    client.delete(
+        collection_name=config.QDRANT_COLLECTION,
+        points_selector=models.FilterSelector(filter=source_filter),
+    )
+    logger.info("已从 Qdrant 删除 %d 个分块（%s）。", count, target_name)
+    return count, sorted(sources)
 
 
 def _qdrant_reset():

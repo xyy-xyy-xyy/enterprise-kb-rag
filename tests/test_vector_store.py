@@ -25,6 +25,11 @@ class _FakePayloadPoint:
         self.payload = payload
 
 
+class _FakeCount:
+    def __init__(self, count):
+        self.count = count
+
+
 class _FakeCollection:
     def __init__(self, name):
         self.name = name
@@ -36,14 +41,24 @@ class _FakeCollections:
 
 
 class _FakeQdrantClient:
-    """只实现被测代码真正调用的四个方法，并记录调用参数。"""
+    """只实现被测代码真正调用的方法，并记录调用参数。"""
 
-    def __init__(self, collections=(), points=(), scroll_error=None, collection_error=None):
+    def __init__(
+        self,
+        collections=(),
+        points=(),
+        scroll_error=None,
+        collection_error=None,
+        count_value=0,
+    ):
         self._collections = _FakeCollections(collections)
         self._points = list(points)
         self._scroll_error = scroll_error
         self._collection_error = collection_error
+        self._count_value = count_value
         self.scroll_calls = []
+        self.count_calls = []
+        self.delete_calls = []
         self.deleted = []
 
     def get_collections(self):
@@ -56,6 +71,17 @@ class _FakeQdrantClient:
         if self._scroll_error:
             raise self._scroll_error
         return self._points, None
+
+    def count(self, collection_name=None, count_filter=None, exact=None):
+        self.count_calls.append(
+            {"collection_name": collection_name, "count_filter": count_filter, "exact": exact}
+        )
+        return _FakeCount(self._count_value)
+
+    def delete(self, collection_name=None, points_selector=None):
+        self.delete_calls.append(
+            {"collection_name": collection_name, "points_selector": points_selector}
+        )
 
     def delete_collection(self, collection_name):
         self.deleted.append(collection_name)
@@ -90,9 +116,13 @@ class _FakeVectorStore:
         self.added = []
         self.saved_to = None
         self.search_calls = []
+        self.deleted_ids = []
 
     def add_documents(self, docs):
         self.added.extend(docs)
+
+    def delete(self, ids):
+        self.deleted_ids.extend(ids)
 
     def save_local(self, path):
         self.saved_to = path
@@ -564,3 +594,210 @@ def test_get_embeddings_reuses_a_single_instance(monkeypatch):
     assert first is second
     assert len(created) == 1
     assert created[0] == {"model": "text-embedding-v2", "dashscope_api_key": "test-key"}
+
+
+# ============================ 索引实例缓存 ============================
+
+
+def test_load_index_caches_the_instance_across_calls(monkeypatch, tmp_path):
+    """同一个后端反复 load 只该真的加载一次：FAISS 反序列化、Qdrant 建连接都不便宜。"""
+    _use_faiss(monkeypatch, tmp_path)
+    calls = []
+    store = _FakeVectorStore()
+
+    def fake_load():
+        calls.append("load")
+        return store
+
+    monkeypatch.setattr(vector_store, "_faiss_load", fake_load)
+
+    first = vector_store.load_index()
+    second = vector_store.load_index()
+
+    assert first is second is store
+    assert calls == ["load"]
+
+
+def test_load_index_cache_key_includes_the_index_directory(monkeypatch, tmp_path):
+    """换了索引目录还复用旧实例，会把 A 库的内容当 B 库返回。"""
+    monkeypatch.setattr(config, "VECTOR_BACKEND", "faiss")
+    calls = []
+
+    def fake_load():
+        calls.append(config.INDEX_DIR)
+        return _FakeVectorStore()
+
+    monkeypatch.setattr(vector_store, "_faiss_load", fake_load)
+
+    monkeypatch.setattr(config, "INDEX_DIR", str(tmp_path / "a"))
+    vector_store.load_index()
+    monkeypatch.setattr(config, "INDEX_DIR", str(tmp_path / "b"))
+    vector_store.load_index()
+
+    assert calls == [str(tmp_path / "a"), str(tmp_path / "b")]
+
+
+def test_load_index_reloads_when_the_backend_switches(monkeypatch, tmp_path):
+    """缓存键必须含后端：切后端还复用旧实例，检索就打到错误的存储上。"""
+    calls = []
+    faiss_store, qdrant_store = _FakeVectorStore(), _FakeVectorStore()
+    monkeypatch.setattr(
+        vector_store, "_faiss_load", lambda: (calls.append("faiss"), faiss_store)[1]
+    )
+    monkeypatch.setattr(
+        vector_store, "_qdrant_load", lambda: (calls.append("qdrant"), qdrant_store)[1]
+    )
+
+    monkeypatch.setattr(config, "VECTOR_BACKEND", "faiss")
+    assert vector_store.load_index() is faiss_store
+    monkeypatch.setattr(config, "VECTOR_BACKEND", "qdrant")
+    assert vector_store.load_index() is qdrant_store
+    # 切回 faiss：键与最早那次相同，但缓存已被 qdrant 覆盖，必须重新加载
+    monkeypatch.setattr(config, "VECTOR_BACKEND", "faiss")
+    assert vector_store.load_index() is faiss_store
+
+    assert calls == ["faiss", "qdrant", "faiss"]
+
+
+def test_create_index_replaces_the_cached_instance(monkeypatch, tmp_path):
+    """新建索引意味着旧实例整体作废：缓存必须跟着换，否则读到已被覆盖的旧库。"""
+    _use_faiss(monkeypatch, tmp_path)
+    old, new = _FakeVectorStore(), _FakeVectorStore(ntotal=3)
+    monkeypatch.setattr(vector_store, "_faiss_load", lambda: old)
+    assert vector_store.load_index() is old
+
+    monkeypatch.setattr(vector_store, "_faiss_create", lambda docs: new)
+    vector_store.create_index([Document(page_content="新库")])
+
+    assert vector_store.load_index() is new
+
+
+def test_invalidate_index_cache_forces_a_reload(monkeypatch, tmp_path):
+    _use_faiss(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        vector_store, "_faiss_load", lambda: (calls.append("load"), _FakeVectorStore())[1]
+    )
+    vector_store.load_index()
+
+    vector_store.invalidate_index_cache()
+    vector_store.load_index()
+
+    assert calls == ["load", "load"]
+
+
+def test_reset_index_invalidates_the_cache(monkeypatch, tmp_path):
+    """重建前 reset 会删掉索引文件：缓存若还留着旧实例，load 会"成功"返回已删除的数据。"""
+    _use_faiss(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        vector_store, "_faiss_load", lambda: (calls.append("load"), _FakeVectorStore())[1]
+    )
+    vector_store.load_index()
+
+    vector_store.reset_index()
+    vector_store.load_index()
+
+    assert calls == ["load", "load"], "reset 后必须重新加载，不能命中已删除索引的缓存"
+
+
+# ============================ 文档分块删除 ============================
+
+
+def test_delete_document_chunks_removes_only_the_matching_file(monkeypatch, tmp_path):
+    """按文件名删除：目标文档的分块全没，其他文档分毫不动，且结果落盘。"""
+    _use_faiss(monkeypatch, tmp_path)
+    docs = [
+        Document(page_content="甲", metadata={"source": "docs/a.pdf", "file_name": "a.pdf"}),
+        Document(page_content="乙", metadata={"source": "docs/a.pdf", "file_name": "a.pdf"}),
+        Document(page_content="丙", metadata={"source": "docs/b.pdf", "file_name": "b.pdf"}),
+    ]
+    store = _FakeVectorStore(docs)
+    saved = []
+    monkeypatch.setattr(vector_store, "load_index", lambda: store)
+    monkeypatch.setattr(vector_store, "save_index", lambda s: saved.append(s))
+
+    deleted, sources = vector_store.delete_document_chunks("a.pdf")
+
+    assert deleted == 2
+    assert sources == ["docs/a.pdf"]
+    assert store.deleted_ids == ["0", "1"]
+    assert saved == [store], "FAISS 的删除只在内存里，必须落盘"
+
+
+def test_delete_document_chunks_matches_old_chunks_by_the_source_basename(monkeypatch, tmp_path):
+    """旧索引的分块如果只有 source 没有 file_name，按 source 的文件名部分也能匹配。"""
+    _use_faiss(monkeypatch, tmp_path)
+    docs = [Document(page_content="甲", metadata={"source": "docs/老制度.pdf"})]
+    store = _FakeVectorStore(docs)
+    monkeypatch.setattr(vector_store, "load_index", lambda: store)
+    monkeypatch.setattr(vector_store, "save_index", lambda s: None)
+
+    assert vector_store.delete_document_chunks("老制度.pdf") == (1, ["docs/老制度.pdf"])
+    assert store.deleted_ids == ["0"]
+
+
+def test_delete_document_chunks_is_a_noop_without_a_match(monkeypatch, tmp_path):
+    """删除不存在的文档：不该误删任何分块，也不该白落盘一次。"""
+    _use_faiss(monkeypatch, tmp_path)
+    docs = [Document(page_content="甲", metadata={"source": "docs/a.pdf", "file_name": "a.pdf"})]
+    store = _FakeVectorStore(docs)
+    monkeypatch.setattr(vector_store, "load_index", lambda: store)
+    saved = []
+    monkeypatch.setattr(vector_store, "save_index", lambda s: saved.append(s))
+
+    assert vector_store.delete_document_chunks("不存在.pdf") == (0, [])
+    assert store.deleted_ids == []
+    assert saved == []
+
+
+def test_qdrant_delete_document_chunks_deletes_by_an_exact_source_filter(monkeypatch):
+    """source 是归一化绝对路径，filter 必须用精确值；同名不同目录的 source 全删。"""
+    client = _use_qdrant(
+        monkeypatch,
+        _FakeQdrantClient(
+            collections=["my_kb"],
+            points=[
+                _FakePayloadPoint({"metadata": {"source": "docs/a.pdf", "file_name": "a.pdf"}}),
+                _FakePayloadPoint({"metadata": {"source": "kb/a.pdf", "file_name": "a.pdf"}}),
+                _FakePayloadPoint({"metadata": {"source": "docs/b.pdf", "file_name": "b.pdf"}}),
+            ],
+            count_value=2,
+        ),
+        collection="my_kb",
+    )
+
+    deleted, sources = vector_store.delete_document_chunks("a.pdf")
+
+    assert (deleted, sources) == (2, ["docs/a.pdf", "kb/a.pdf"])
+    assert client.scroll_calls[0]["with_payload"] == ["metadata.source", "metadata.file_name"]
+    should = client.count_calls[0]["count_filter"].should
+    assert {c.match.value for c in should} == {"docs/a.pdf", "kb/a.pdf"}
+    assert client.count_calls[0]["exact"] is True
+    selector = client.delete_calls[0]["points_selector"]
+    assert {c.match.value for c in selector.filter.should} == {"docs/a.pdf", "kb/a.pdf"}
+    assert client.delete_calls[0]["collection_name"] == "my_kb"
+
+
+def test_qdrant_delete_document_chunks_is_a_noop_without_a_match(monkeypatch):
+    client = _use_qdrant(
+        monkeypatch,
+        _FakeQdrantClient(
+            collections=["my_kb"],
+            points=[
+                _FakePayloadPoint({"metadata": {"source": "docs/b.pdf", "file_name": "b.pdf"}})
+            ],
+        ),
+        collection="my_kb",
+    )
+
+    assert vector_store.delete_document_chunks("a.pdf") == (0, [])
+    assert client.count_calls == []
+    assert client.delete_calls == []
+
+
+def test_qdrant_delete_document_chunks_raises_when_the_collection_is_missing(monkeypatch):
+    _use_qdrant(monkeypatch, _FakeQdrantClient(collections=[]), collection="my_kb")
+
+    with pytest.raises(vector_store.IndexNotReadyError, match="my_kb"):
+        vector_store.delete_document_chunks("a.pdf")

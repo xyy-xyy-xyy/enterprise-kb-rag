@@ -109,6 +109,60 @@ async def api_ingest(file: UploadFile = File(...)) -> dict:
     return {"status": "success", "chunks": chunks, "file": target}
 
 
+@app.delete("/api/documents/{filename}")
+def api_delete_document(filename: str) -> dict:
+    """删除文档：索引中的全部分块 + 磁盘上的源文件，返回删除统计。
+
+    filename 是逻辑文件名（如 "差旅办法.pdf"）。安全上只接受纯文件名，
+    任何带路径分隔符的输入直接 400，防止目录穿越删到知识库以外的文件。
+    """
+    name = os.path.basename(filename)
+    if not name or name != filename or name in (".", ".."):
+        raise HTTPException(status_code=400, detail="文件名不合法，只能是纯文件名。")
+
+    # 磁盘上三种形态都可能存在：明文、密文、--encrypt-all 退役留下的 .bak 明文备份
+    base = os.path.join(config.DOCS_PATH, name)
+    disk_paths = [
+        path
+        for path in (base, base + crypto.ENC_SUFFIX, base + crypto._BAK_SUFFIX)
+        if os.path.exists(path)
+    ]
+
+    chunks_deleted, sources = 0, []
+    index_error = None
+    try:
+        chunks_deleted, sources = vector_store.delete_document_chunks(name)
+    except vector_store.IndexNotReadyError as exc:
+        # 索引还没建过：删磁盘文件仍然是有意义的动作
+        index_error = exc
+
+    if not sources and not disk_paths:
+        raise HTTPException(status_code=404, detail=f"知识库中不存在文档：{name}")
+
+    removed = []
+    for path in disk_paths:
+        try:
+            os.remove(path)
+            removed.append(os.path.basename(path))
+        except OSError:
+            # 索引已清理干净，个别文件删不掉只记日志，不算失败
+            logger.exception("删除源文件失败：%s", path)
+
+    # BM25 缓存靠分块指纹也能自动失效，这里显式清一次，语义更直接
+    retrieval.invalidate_bm25_cache()
+    logger.info("文档删除完成：%s（%d 个分块，%d 个源文件）", name, chunks_deleted, len(removed))
+
+    result = {
+        "status": "success",
+        "file": name,
+        "chunks_deleted": chunks_deleted,
+        "source_files_removed": removed,
+    }
+    if index_error is not None:
+        result["warning"] = "索引尚未建立，本次仅删除了磁盘文件。"
+    return result
+
+
 @app.post("/api/ask")
 def api_ask(payload: AskRequest) -> dict:
     """提问并返回答案与来源（一次性返回）。"""

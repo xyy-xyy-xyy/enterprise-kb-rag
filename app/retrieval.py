@@ -9,9 +9,9 @@ from collections.abc import Iterator
 
 import jieba
 from dashscope import TextReRank
-from langchain_community.chat_models import ChatTongyi
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage
+from langchain_openai import ChatOpenAI
 from rank_bm25 import BM25Okapi
 
 from app import config, vector_store
@@ -58,26 +58,27 @@ _llm = None
 _rewrite_llm = None
 
 
-def get_llm() -> ChatTongyi:
-    """返回通义千问模型实例（进程内复用）。
+def get_llm() -> ChatOpenAI:
+    """返回对话模型实例（进程内复用）。
 
-    必须显式 streaming=True：ChatTongyi 默认 streaming=False，此时 .stream()
-    会退化成"生成完整段后一次性返回"（实测只有 1 个 chunk），前端看不到打字机效果。
-    打开后 .stream() 才会逐 token 吐出（实测 50+ chunk）。
+    走 OpenAI 兼容端点（config.LLM_BASE_URL）：qwen3.8 等新模型只发布在
+    DashScope 的 compatible-mode 端点上，老的 ChatTongyi 原生 SDK 端点会报
+    "url error"。streaming=True 是打字机效果的硬前提，必须显式开启。
     """
     global _llm
     if _llm is None:
         config.validate()
-        _llm = ChatTongyi(
-            model_name=config.LLM_MODEL,
-            dashscope_api_key=config.DASHSCOPE_API_KEY,
+        _llm = ChatOpenAI(
+            model=config.LLM_MODEL,
+            api_key=config.DASHSCOPE_API_KEY,
+            base_url=config.LLM_BASE_URL,
             streaming=True,
         )
-        logger.debug("已初始化 LLM %s（streaming=True）", config.LLM_MODEL)
+        logger.debug("已初始化 LLM %s（streaming=True，%s）", config.LLM_MODEL, config.LLM_BASE_URL)
     return _llm
 
 
-def get_rewrite_llm() -> ChatTongyi:
+def get_rewrite_llm() -> ChatOpenAI:
     """查询改写专用实例（streaming=False）。
 
     不复用 get_llm()：那是 streaming=True 的实例，改写只需要一次完整返回，
@@ -86,9 +87,10 @@ def get_rewrite_llm() -> ChatTongyi:
     global _rewrite_llm
     if _rewrite_llm is None:
         config.validate()
-        _rewrite_llm = ChatTongyi(
-            model_name=config.LLM_MODEL,
-            dashscope_api_key=config.DASHSCOPE_API_KEY,
+        _rewrite_llm = ChatOpenAI(
+            model=config.LLM_MODEL,
+            api_key=config.DASHSCOPE_API_KEY,
+            base_url=config.LLM_BASE_URL,
             streaming=False,
         )
         logger.debug("已初始化查询改写 LLM %s（streaming=False）", config.LLM_MODEL)
@@ -136,6 +138,16 @@ def _get_bm25_index() -> tuple[BM25Okapi | None, list[Document]]:
     logger.info("已构建 BM25 索引，共 %d 个分块。", len(documents))
     _bm25_cache = (signature, bm25, documents)
     return bm25, documents
+
+
+def invalidate_bm25_cache() -> None:
+    """文档删除 / 重建后显式清掉 BM25 缓存，下一次检索自动重建。
+
+    常规增删靠分块指纹比对也能感知变化，但那是隐式行为；这里显式清空，
+    让"文档已变更"这个事件直接对应"下次必重建"。
+    """
+    global _bm25_cache
+    _bm25_cache = None
 
 
 def _bm25_recall(bm25: BM25Okapi, documents: list[Document], query: str, n: int) -> list[Document]:

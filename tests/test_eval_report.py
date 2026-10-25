@@ -176,7 +176,7 @@ def test_render_report_flags_hit_at_k_ceiling_when_all_strategies_tie(payload):
     report = run_eval.render_report(payload)
 
     assert "Hit@5 已触顶、失去区分度" in report
-    assert "四个方案的 Hit@5 都是 100.0%" in report
+    assert "各方案的 Hit@5 都是 100.0%" in report
     assert "实际差异要看 Hit@1 与 MRR" in report
 
 
